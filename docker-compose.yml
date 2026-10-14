@@ -1,0 +1,8 @@
+services:
+  bot:
+    build: .
+    env_file: .env
+    restart: unless-stopped
+    # ถ้าใช้ไฟล์ cookies ของ YouTube ให้วาง cookies.txt ไว้ข้างไฟล์นี้ และตั้ง YTDL_COOKIES=/app/cookies.txt ใน .env
+    # volumes:
+    #   - ./cookies.txt:/app/cookies.txt

@@ -1,0 +1,7 @@
+discord.py[voice]==2.7.1
+yt-dlp[default]>=2026.8.19
+python-dotenv>=1.0.1
+# now-playing banner image (Thai/CJK text shaping)
+pillow>=11.0
+uharfbuzz>=0.50
+freetype-py>=2.5
