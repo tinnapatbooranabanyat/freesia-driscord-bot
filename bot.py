@@ -18,15 +18,18 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("bot")
 
 HELP_TEXT = """**🤖 คุยกับ AI**
-• `@บอท คำถาม` — mention บอทในห้องไหนก็ได้แล้วพิมพ์คำถาม (reply ข้อความคนอื่นแล้ว @บอท เพื่อให้อธิบายข้อความนั้นได้)
-• `/ask` — ถามผ่าน slash command
-• `/reset` — ล้างความจำบทสนทนาในห้องนี้
+• `@บอท คำถาม` — ถามได้ทุกห้อง (+ DM) AI ค้นเว็บเองเมื่อถามเรื่องล่าสุด แนบรูปให้ดูได้
+• reply ข้อความของบอท = คุยต่อได้เลยไม่ต้อง @ • reply ข้อความคนอื่นแล้ว @บอท = ให้อธิบายข้อความนั้น
+• `/ask` ถาม (แนบรูปได้) • `/summarize` สรุปแชทล่าสุด • `/reset` ล้างความจำในห้องนี้
+• คลิกขวาที่ข้อความ → Apps → **แปลภาษา** / **สรุป / อธิบาย**
+• `/persona` ตั้งบุคลิก AI ของเซิร์ฟเวอร์ (แอดมิน)
 
-**🎵 เพลง** (รองรับลิงก์ YouTube, YouTube Music, Spotify, เพลย์ลิสต์ หรือพิมพ์ชื่อเพลง)
-• `/play` เปิดเพลง/เพิ่มลงคิว  • `/pause` `/resume` หยุด/เล่นต่อ
-• `/skip` ข้ามเพลง  • `/stop` หยุดและออกจากห้อง  • `/leave` ออกจากห้อง
-• `/queue` ดูคิว  • `/nowplaying` เพลงที่เล่นอยู่  • `/volume` ปรับเสียง
-• `/loop` วนซ้ำ  • `/shuffle` สลับคิว  • `/remove` ลบเพลงจากคิว  • `/clear` ล้างคิว"""
+**🎵 เพลง** (ลิงก์ YouTube / YT Music / Spotify / เพลย์ลิสต์ / Mix หรือพิมพ์ชื่อเพลง)
+• `/play` เปิดเพลง • `/pause` `/resume` • `/skip` ข้าม (คนอื่นต้องโหวต) • `/stop` `/leave`
+• `/queue` คิว • `/nowplaying` • `/lyrics` เนื้อเพลง • `/seek 1:30` • `/volume`
+• `/filter` เอฟเฟกต์ (bassboost, nightcore, slowed…) • `/autoplay` เล่นเพลงแนวเดียวกันต่อเมื่อคิวหมด
+• `/loop` `/shuffle` `/remove` `/clear` • `/playlist save|load|list|delete` เพลย์ลิสต์ส่วนตัว
+-# ยศชื่อ **DJ** / แอดมิน / คนที่อยู่คนเดียวในห้อง: ข้ามเพลงได้ทันที และใช้ /stop /clear ได้"""
 
 
 class Bot(commands.Bot):

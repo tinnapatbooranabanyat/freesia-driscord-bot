@@ -13,4 +13,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 ENV PYTHONUNBUFFERED=1
-CMD ["python", "bot.py"]
+# Update yt-dlp on every container start (YouTube changes often; old versions stop working)
+CMD ["sh", "-c", "pip install -q -U --disable-pip-version-check 'yt-dlp[default]' || true; exec python bot.py"]
