@@ -11,6 +11,8 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
+from core.storage import Storage
+
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("bot")
@@ -39,6 +41,7 @@ class Bot(commands.Bot):
             activity=discord.Activity(type=discord.ActivityType.listening, name="/help • @mention เพื่อถาม AI"),
         )
         self._web_runner: web.AppRunner | None = None
+        self.storage = Storage()
 
     async def setup_hook(self) -> None:
         await self.load_extension("cogs.chat")
@@ -74,6 +77,7 @@ class Bot(commands.Bot):
         if self._web_runner:
             await self._web_runner.cleanup()
         await super().close()
+        self.storage.close()
 
     async def on_ready(self) -> None:
         log.info("Logged in as %s (id %s) in %d servers", self.user, self.user.id, len(self.guilds))

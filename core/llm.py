@@ -71,12 +71,12 @@ class LLMClient:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    async def chat(self, messages: list[dict]) -> LLMReply:
+    async def chat(self, messages: list[dict], allow_search: bool = True) -> LLMReply:
         """Try every model (with web search first where supported). If all are only briefly rate limited
         (free tiers limit tokens per minute), wait a few seconds and try once more."""
         errors: list[str] = []
         for attempt in range(2):
-            reply, retry_after = await self._try_models(messages, errors)
+            reply, retry_after = await self._try_models(messages, errors, allow_search)
             if reply:
                 return reply
             if attempt == 0 and retry_after is not None and retry_after <= MAX_RETRY_WAIT:
@@ -86,14 +86,16 @@ class LLMClient:
             break
         raise LLMError("; ".join(errors) or "no models available")
 
-    async def _try_models(self, messages: list[dict], errors: list[str]) -> tuple[LLMReply | None, float | None]:
+    async def _try_models(
+        self, messages: list[dict], errors: list[str], allow_search: bool
+    ) -> tuple[LLMReply | None, float | None]:
         session = await self._get_session()
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         shortest_wait: float | None = None
 
         attempts = []
         for model in self.models:
-            if self.supports_search(model):
+            if allow_search and self.supports_search(model):
                 attempts.append((model, True))
             attempts.append((model, False))
 
