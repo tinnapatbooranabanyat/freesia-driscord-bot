@@ -320,15 +320,19 @@ class GuildPlayer:
                     log.warning("Failed to resolve %s: %r", track.title, e)
                     failures += 1
                     err = str(e)
-                    if "not a bot" in err or failures >= 3:
-                        # YouTube is blocking this server's IP: don't burn through the whole queue
+                    blocked = "not a bot" in err
+                    if failures >= 3:
+                        # Several songs in a row failed: YouTube is probably blocking us, don't burn through the queue
                         self.queue.clear()
                         await self._send(
-                            "⚠️ YouTube บล็อกการดึงเพลงชั่วคราว (`Sign in to confirm you're not a bot`) "
-                            "จึงล้างคิวไว้ก่อน — ลองใหม่ภายหลัง หรือให้แอดมินตั้งค่า YTDL_COOKIES (ดู README)"
+                            "⚠️ เปิดเพลงไม่ได้ติดกัน 3 เพลง"
+                            + (" (YouTube ขอให้ยืนยันว่าไม่ใช่บอท)" if blocked else "")
+                            + " จึงล้างคิวไว้ก่อน — ลองใหม่ภายหลัง หรือให้แอดมินตั้งค่า YTDL_COOKIES (ดู README)"
                         )
-                        await self.cog.notify("youtube-block", f"⚠️ YouTube บล็อกการดึงเพลงในเซิร์ฟเวอร์ **{self.guild.name}**\n`{err[:300]}`")
+                        await self.cog.notify("youtube-block", f"⚠️ เปิดเพลงไม่ได้ติดกันในเซิร์ฟเวอร์ **{self.guild.name}**\n`{err[:300]}`")
                         failures = 0
+                    elif blocked:
+                        await self._send(f"⚠️ YouTube ไม่ให้เปิด **{track.title}** (ขอให้ยืนยันว่าไม่ใช่บอท) ข้ามไปเพลงถัดไป")
                     else:
                         await self._send(f"⚠️ เล่น **{track.title}** ไม่ได้ ข้ามไปเพลงถัดไป\n`{err[:200]}`")
                     continue
