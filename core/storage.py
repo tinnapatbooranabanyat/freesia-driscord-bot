@@ -39,6 +39,18 @@ CREATE TABLE IF NOT EXISTS playlists (
     created REAL NOT NULL,
     PRIMARY KEY (user_id, name)
 );
+
+CREATE TABLE IF NOT EXISTS reminders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    guild_id INTEGER,
+    channel_id INTEGER,
+    due REAL NOT NULL,
+    text TEXT NOT NULL,
+    dm INTEGER NOT NULL DEFAULT 0,
+    created REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS reminders_due ON reminders(due);
 """
 
 
@@ -104,6 +116,40 @@ class Storage:
                 "ON CONFLICT(guild_id, key) DO UPDATE SET value=excluded.value",
                 (guild_id, key, value),
             ))
+
+    async def all_settings(self, key: str) -> list[tuple[int, str]]:
+        """(guild_id, value) for every server that has this setting."""
+        return await self._run(lambda c: c.execute(
+            "SELECT guild_id, value FROM guild_settings WHERE key=?", (key,)).fetchall())
+
+    # ---------- reminders ----------
+
+    async def add_reminder(self, user_id: int, guild_id: int | None, channel_id: int | None,
+                           due: float, text: str, dm: bool) -> int:
+        cur = await self._run(lambda c: c.execute(
+            "INSERT INTO reminders(user_id, guild_id, channel_id, due, text, dm, created) VALUES (?,?,?,?,?,?,?)",
+            (user_id, guild_id, channel_id, due, text, int(dm), time.time()),
+        ))
+        return cur.lastrowid
+
+    async def list_reminders(self, user_id: int) -> list[tuple[int, float, str]]:
+        return await self._run(lambda c: c.execute(
+            "SELECT id, due, text FROM reminders WHERE user_id=? ORDER BY due", (user_id,)).fetchall())
+
+    async def delete_reminder(self, user_id: int, reminder_id: int) -> bool:
+        cur = await self._run(lambda c: c.execute(
+            "DELETE FROM reminders WHERE id=? AND user_id=?", (reminder_id, user_id)))
+        return cur.rowcount > 0
+
+    async def pop_due_reminders(self, now: float) -> list[dict]:
+        def take(c: sqlite3.Connection):
+            rows = c.execute(
+                "SELECT id, user_id, guild_id, channel_id, due, text, dm FROM reminders WHERE due<=?", (now,)
+            ).fetchall()
+            c.executemany("DELETE FROM reminders WHERE id=?", [(r[0],) for r in rows])
+            return rows
+        keys = ("id", "user_id", "guild_id", "channel_id", "due", "text", "dm")
+        return [dict(zip(keys, r)) for r in await self._run(take)]
 
     # ---------- playlists ----------
 

@@ -2,14 +2,19 @@
 and reads images through a vision model (Gemini) when one is configured."""
 from __future__ import annotations
 
+import asyncio
 import base64
+import io
 import logging
 import os
+import random
 import re
 import time
 from collections import OrderedDict, defaultdict, deque
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -30,6 +35,14 @@ THAI_TZ = timezone(timedelta(hours=7))
 NO_PINGS = discord.AllowedMentions.none()
 IMAGE_TYPES = ("image/png", "image/jpeg", "image/webp", "image/gif")
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
+MAX_AUDIO_BYTES = 25 * 1024 * 1024  # Groq Whisper upload limit
+# "@bot เปิดเพลงเศร้าๆ ให้หน่อย", "ขอเพลงแนว lofi", "play some jazz" -> AI DJ (questions about how to play don't count)
+_DJ_INTENT = re.compile(
+    r"^\s*(?:ช่วย|ขอ|อยาก|ไหน|ลอง)?\s*(?:เปิด|เล่น|ขอ|หา|อยากฟัง)\s*เพลง|เปิด.{1,40}(?:ให้ฟัง|หน่อย|ที|เลย)|^\s*(?:play|dj)\b",
+    re.I,
+)
+_DJ_NOT = re.compile(r"ยังไง|อย่างไร|วิธี|ทำไม|ได้ไหม\s*\?|how\b|why\b", re.I)
+IMAGE_SIZES = {"square": (1024, 1024), "landscape": (1344, 768), "portrait": (768, 1344)}
 LLM_UNAVAILABLE = "ขอโทษครับ ตอนนี้ AI ตอบไม่ได้ (อาจโดน rate limit ของโมเดลฟรี) ลองใหม่อีกครั้งในอีกสักครู่นะครับ 🙏"
 
 
@@ -111,14 +124,17 @@ class Chat(commands.Cog):
         self.limiter = RateLimiter(int(os.getenv("AI_USER_LIMIT", "5")), float(os.getenv("AI_USER_WINDOW", "60")))
         self._ai_messages: OrderedDict[int, None] = OrderedDict()  # ids of AI answers, so replies continue the chat
 
-        self.ctx_translate = app_commands.ContextMenu(name="แปลภาษา", callback=self.translate_message)
-        self.ctx_explain = app_commands.ContextMenu(name="สรุป / อธิบาย", callback=self.explain_message)
-        bot.tree.add_command(self.ctx_translate)
-        bot.tree.add_command(self.ctx_explain)
+        self.context_menus = [
+            app_commands.ContextMenu(name="แปลภาษา", callback=self.translate_message),
+            app_commands.ContextMenu(name="สรุป / อธิบาย", callback=self.explain_message),
+            app_commands.ContextMenu(name="ถอดข้อความเสียง", callback=self.transcribe_message),
+        ]
+        for menu in self.context_menus:
+            bot.tree.add_command(menu)
 
     async def cog_unload(self) -> None:
-        self.bot.tree.remove_command(self.ctx_translate.name, type=self.ctx_translate.type)
-        self.bot.tree.remove_command(self.ctx_explain.name, type=self.ctx_explain.type)
+        for menu in self.context_menus:
+            self.bot.tree.remove_command(menu.name, type=menu.type)
         await self.llm.close()
         if self.vision:
             await self.vision.close()
@@ -266,6 +282,20 @@ class Chat(commands.Cog):
                 except discord.HTTPException:
                     pass
 
+        is_dm = message.guild is None
+        # Voice messages / audio files: speech to text first
+        transcript = None
+        if self._audio(message):
+            try:
+                async with message.channel.typing():
+                    transcript = await self._transcribe(message)
+            except LLMError as e:
+                log.error("Transcription error: %s", e)
+                await message.reply("ขอโทษครับ ถอดข้อความเสียงไม่ได้ ลองใหม่อีกครั้งนะ 🙏", mention_author=False)
+                return
+            if transcript:
+                question = f"{question}\n{transcript}".strip()
+
         images = await self._images(message, ref)
         if not question.strip() and not images:
             await message.reply("สวัสดีครับ 👋 มีอะไรให้ช่วยไหม? พิมพ์คำถามต่อท้ายการ mention ได้เลย", mention_author=False)
@@ -273,7 +303,20 @@ class Chat(commands.Cog):
         if not question.strip():
             question = "ช่วยอธิบายรูปนี้หน่อย"
 
-        is_dm = message.guild is None
+        # "@bot เปิดเพลงเศร้าๆ ให้หน่อย" -> AI DJ picks songs and queues them
+        music = self.bot.get_cog("Music")
+        request = transcript or self._clean_content(message)
+        if music and not is_dm and not images and _DJ_INTENT.search(request) and not _DJ_NOT.search(request):
+            try:
+                async with message.channel.typing():
+                    text = await music.dj_request(message.author, message.channel, request)
+            except LLMError as e:
+                log.error("DJ LLM error: %s", e)
+                await message.reply(LLM_UNAVAILABLE, mention_author=False)
+                return
+            await self._reply(message, (f"> 🎙️ {transcript[:300]}\n" if transcript else "") + text)
+            return
+
         where = "ข้อความส่วนตัว (DM)" if is_dm else f"เซิร์ฟเวอร์ {message.guild.name} ห้อง #{message.channel.name}"
         try:
             async with message.channel.typing():
@@ -283,7 +326,36 @@ class Chat(commands.Cog):
             log.error("LLM error: %s", e)
             await message.reply(LLM_UNAVAILABLE, mention_author=False)
             return
-        await self._reply(message, answer)
+        await self._reply(message, (f"> 🎙️ *{transcript[:300]}*\n\n" if transcript else "") + answer)
+
+        # Talk mode: also read the answer aloud in the asker's voice channel
+        if music and not is_dm:
+            gender = await self.storage.get_setting(message.guild.id, "talk")
+            voice = message.author.voice
+            vc = message.guild.voice_client
+            if gender and voice and voice.channel and (vc is None or vc.channel == voice.channel):
+                asyncio.create_task(self._speak(music, message, answer, gender))
+
+    async def _speak(self, music, message: discord.Message, text: str, gender: str) -> None:
+        error = await music.speak_text(message.author, message.channel, text, gender)
+        if error:
+            log.info("Talk mode could not speak: %s", error)
+
+    @staticmethod
+    def _audio(message: discord.Message) -> discord.Attachment | None:
+        for att in message.attachments:
+            ctype = (att.content_type or "").split(";")[0]
+            if (att.is_voice_message() or ctype.startswith("audio/")) and att.size <= MAX_AUDIO_BYTES:
+                return att
+        return None
+
+    async def _transcribe(self, message: discord.Message) -> str | None:
+        att = self._audio(message)
+        if not att:
+            return None
+        data = await att.read()
+        ctype = (att.content_type or "audio/ogg").split(";")[0]
+        return await self.llm.transcribe(data, att.filename or "voice.ogg", ctype)
 
     # ---------- slash commands ----------
 
@@ -406,6 +478,62 @@ class Chat(commands.Cog):
             "ถ้าสั้นหรือมีศัพท์เฉพาะ/มุก/โค้ด ให้อธิบายความหมาย",
             search=True,
         )
+
+    async def transcribe_message(self, interaction: discord.Interaction, message: discord.Message) -> None:
+        if not self._audio(message):
+            await interaction.response.send_message("ข้อความนี้ไม่มีข้อความเสียงหรือไฟล์เสียง", ephemeral=True)
+            return
+        if not await self._check_limit(interaction):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            text = await self._transcribe(message)
+        except LLMError as e:
+            log.error("Transcription error: %s", e)
+            await interaction.followup.send("ขอโทษครับ ถอดข้อความเสียงไม่ได้ ลองใหม่อีกครั้งนะ 🙏", ephemeral=True)
+            return
+        for chunk in split_message(f"🎙️ **{message.author.display_name}** พูดว่า:\n>>> {text or '(ไม่ได้ยินคำพูด)'}"):
+            await interaction.followup.send(chunk, ephemeral=True, allowed_mentions=NO_PINGS)
+
+    # ---------- /imagine ----------
+
+    @app_commands.command(name="imagine", description="ให้ AI วาดรูปจากข้อความ")
+    @app_commands.describe(prompt="อยากได้รูปอะไร พิมพ์ไทยได้เลย", shape="รูปทรงภาพ")
+    @app_commands.choices(shape=[app_commands.Choice(name="⬜ สี่เหลี่ยมจัตุรัส", value="square"),
+                                 app_commands.Choice(name="🖼️ แนวนอน", value="landscape"),
+                                 app_commands.Choice(name="📱 แนวตั้ง", value="portrait")])
+    async def imagine(self, interaction: discord.Interaction, prompt: app_commands.Range[str, 2, 500],
+                      shape: app_commands.Choice[str] | None = None) -> None:
+        if not await self._check_limit(interaction):
+            return
+        await interaction.response.defer(thinking=True)
+        # Image models understand English prompts far better: let the LLM translate and enrich the request
+        try:
+            english = await self.one_shot(
+                "Rewrite the user's image request as one vivid, detailed English prompt for an AI image generator "
+                "(subject, style, lighting, composition). Keep it under 60 words. Reply with the prompt only.",
+                prompt,
+            )
+            english = english.strip().strip('"')[:450]
+        except LLMError:
+            english = prompt
+        width, height = IMAGE_SIZES[shape.value if shape else "square"]
+        url = (f"https://image.pollinations.ai/prompt/{quote(english)}"
+               f"?width={width}&height={height}&nologo=true&safe=true&seed={random.randint(1, 10**9)}")
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=150)) as session:
+                async with session.get(url) as r:
+                    data = await r.read() if r.status == 200 and r.content_type.startswith("image/") else None
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            log.warning("Image generation failed: %r", e)
+            data = None
+        if not data:
+            await interaction.followup.send("😢 สร้างรูปไม่สำเร็จ (บริการฟรีอาจคนใช้เยอะ) ลองใหม่อีกครั้งนะ")
+            return
+        embed = discord.Embed(title=f"🎨 {prompt[:250]}", color=discord.Color.blurple())
+        embed.set_image(url="attachment://imagine.jpg")
+        embed.set_footer(text=f"วาดโดย Pollinations.ai • ขอโดย {interaction.user.display_name}")
+        await interaction.followup.send(embed=embed, file=discord.File(io.BytesIO(data), filename="imagine.jpg"))
 
     # ---------- /persona ----------
 

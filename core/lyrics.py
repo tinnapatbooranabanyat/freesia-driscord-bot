@@ -13,21 +13,6 @@ log = logging.getLogger(__name__)
 API = "https://lrclib.net/api/search"
 HEADERS = {"User-Agent": "discord-llm-bot/1.0 (self-hosted Discord bot)"}
 
-# "(Official MV)", "[Lyric Video]", "| 4K", "ft. X" ... are noise for a lyrics search
-_NOISE = re.compile(
-    r"[\(\[【][^\)\]】]*(official|m/?v|music video|video|audio|lyric|visuali[sz]er|4k|hd|hq|remaster|"
-    r"live|performance|teaser|color coded|eng|sub|ver\.?)[^\)\]】]*[\)\]】]",
-    re.I,
-)
-_FEAT = re.compile(r"\s+(ft\.?|feat\.?|featuring)\s+.*$", re.I)
-_TAIL = re.compile(r"\s*[|｜].*$")
-_SUFFIX = re.compile(
-    r"\s*(official\s*)?((music|lyric)\s*)?(video|audio|mv|m/v|visuali[sz]er)\s*$|\s*(lyrics?|4k|hd|hq)\s*$", re.I
-)
-_JP_TITLE = re.compile(r"[「『](.+?)[」』]")  # YOASOBI「夜に駆ける」 -> song inside the brackets
-_QUOTES = " '\"‘’“”-–—"
-
-
 @dataclass
 class Lyrics:
     title: str
@@ -36,25 +21,62 @@ class Lyrics:
     synced: bool
 
 
+# "(Official MV)", "[Lyric Video]", "「Official MV」", "| 4K", "ft. X" ... are noise for a lyrics search / quiz answer
+_NOISE = re.compile(
+    r"[\(\[【「『][^\)\]】」』]*(official|m/?v|music video|video|audio|lyric|visuali[sz]er|4k|hd|hq|remaster|"
+    r"live|performance|teaser|color coded|eng|sub|ver\.?|เพลงจาก|ประกอบ|ost)[^\)\]】」』]*[\)\]】」』]",
+    re.I,
+)
+_FEAT = re.compile(r"\s+(?:ft\.|feat\.|ft\s|feat\s|featuring\s|x\s).*$", re.I)
+_TAIL = re.compile(r"\s*[|｜].*$")
+_SUFFIX = re.compile(
+    r"\s*(official\s*)?((music|lyric)\s*)?(video|audio|mv|m/v|visuali[sz]er)\s*$|\s*(lyrics?|4k|hd|hq)\s*$", re.I
+)
+_JP_TITLE = re.compile(r"[「『](.+?)[」』]")  # YOASOBI「夜に駆ける」 -> song inside the brackets
+_QUOTED = re.compile(r"['‘’\"“”](.+?)(?:['‘’\"“”]|$)")  # aespa 'LEMONADE' MV -> song in quotes
+_QUOTES = " '\"‘’“”-–—"
+_THAI = re.compile(r"[฀-๿]")
+
+
+def _same(a: str | None, b: str) -> bool:
+    """Loose "is this the same name" check (channel names like 'GRAMMY GOLD OFFICIAL' vs 'ต่าย อรทัย')."""
+    if not a:
+        return False
+    a, b = re.sub(r"\W", "", a.lower()), re.sub(r"\W", "", b.lower())
+    return bool(a and b) and (a in b or b in a)
+
+
 def clean_title(title: str, artist: str | None) -> tuple[str, str | None]:
-    """Strip video noise and split "Artist - Song" titles. Returns (song, artist)."""
+    """Strip video noise and work out (song, artist) from a YouTube title."""
     if artist:
         artist = re.sub(r"\s*-\s*Topic$", "", artist).strip()  # YouTube auto-generated "Artist - Topic"
-    t = _TAIL.sub("", _NOISE.sub("", title))
+    t = _TAIL.sub("", _NOISE.sub("", title)).strip()
     jp = _JP_TITLE.search(t)
+    quoted = _QUOTED.search(t)
     if jp:
         artist = t[:jp.start()].strip(_QUOTES) or artist
         t = jp.group(1)
+    elif quoted and t[:quoted.start()].strip(_QUOTES):
+        artist = t[:quoted.start()].strip(_QUOTES)
+        t = quoted.group(1)
     t = _FEAT.sub("", t).strip(_QUOTES)
-    if " - " in t:
-        left, right = t.split(" - ", 1)
-        if not artist or artist.lower() in left.lower() or left.lower() in (artist or "").lower():
-            artist, t = left, right
+    for sep in (" - ", " – ", " / "):
+        if sep in t:
+            left, right = (s.strip(_QUOTES) for s in t.split(sep, 1))
+            if _same(artist, left):
+                artist, t = left, right
+            elif _same(artist, right):
+                artist, t = right, left
+            elif _THAI.search(left):  # Thai MVs are usually "ชื่อเพลง - ศิลปิน"
+                t, artist = left, right
+            else:  # international convention "Artist - Song"
+                artist, t = left, right
+            break
     previous = None
     while previous != t:  # peel off trailing "M/V", "Official Video", "Lyrics", quotes...
         previous = t
         t = _SUFFIX.sub("", t).strip(_QUOTES)
-    t = re.sub(r"\s+", " ", t).strip()
+    t = _FEAT.sub("", re.sub(r"\s+", " ", t)).strip()
     return t or title, artist
 
 

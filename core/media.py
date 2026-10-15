@@ -92,6 +92,13 @@ def extract_query(query: str) -> tuple[str | None, list[dict]]:
     return None, [info]
 
 
+def search(query: str, count: int = 5) -> list[dict]:
+    """Top YouTube results for a text query (flat: title / url / duration / channel, no stream URL)."""
+    with yt_dlp.YoutubeDL(_ytdl_opts(extract_flat="in_playlist", noplaylist=False)) as ydl:
+        info = ydl.extract_info(f"ytsearch{count}:{query}", download=False)
+    return [e for e in (info or {}).get("entries") or [] if e and e.get("id")]
+
+
 def related(seed_id: str, exclude: set[str], count: int = 8) -> list[dict]:
     """Songs similar to a YouTube video, taken from its YouTube Mix (what autoplay on YouTube uses)."""
     _, entries = extract_query(f"https://www.youtube.com/watch?v={seed_id}&list=RD{seed_id}")

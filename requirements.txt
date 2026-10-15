@@ -5,3 +5,7 @@ python-dotenv>=1.0.1
 pillow>=11.0
 uharfbuzz>=0.50
 freetype-py>=2.5
+# AI voice: text-to-speech in voice channels
+edge-tts>=7.0
+# /status memory usage
+psutil>=5.9

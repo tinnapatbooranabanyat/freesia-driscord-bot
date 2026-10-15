@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 
@@ -52,6 +53,7 @@ class LLMClient:
         self.models = models
         self.max_tokens = max_tokens
         self.web_search = web_search
+        self.whisper_model = os.getenv("WHISPER_MODEL", "whisper-large-v3-turbo")
         self._session: aiohttp.ClientSession | None = None
 
     def supports_search(self, model: str) -> bool:
@@ -137,6 +139,21 @@ class LLMClient:
             errors.append(f"{label}: empty response")
 
         return None, shortest_wait
+
+    async def transcribe(self, audio: bytes, filename: str, content_type: str = "audio/ogg") -> str:
+        """Speech to text with the provider's Whisper endpoint (Groq offers it on the free tier)."""
+        session = await self._get_session()
+        form = aiohttp.FormData()
+        form.add_field("file", audio, filename=filename, content_type=content_type)
+        form.add_field("model", self.whisper_model)
+        try:
+            async with session.post(self.url.replace("/chat/completions", "/audio/transcriptions"), data=form,
+                                    headers={"Authorization": f"Bearer {self.api_key}"}) as resp:
+                if resp.status != 200:
+                    raise LLMError(f"transcription HTTP {resp.status}: {(await resp.text())[:200]}")
+                return ((await resp.json()).get("text") or "").strip()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            raise LLMError(f"transcription failed: {e!r}") from e
 
     @staticmethod
     def _sources(message: dict) -> list[tuple[str, str]]:

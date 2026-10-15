@@ -301,3 +301,90 @@ def _render(thumbnail, title, artist, duration, position, footer, label):
     out = io.BytesIO()
     card.convert("RGB").save(out, "PNG", optimize=True)
     return out.getvalue(), accent
+
+
+# ---------------------------------------------------------------------------
+# Welcome card (new member joins)
+# ---------------------------------------------------------------------------
+
+WW, WH = 1000, 460
+
+
+def _circle(img: Image.Image, size: int) -> Image.Image:
+    """Anti-aliased circular crop (mask drawn at 4x then downsampled)."""
+    big = Image.new("L", (size * 4, size * 4), 0)
+    ImageDraw.Draw(big).ellipse((0, 0, size * 4 - 1, size * 4 - 1), fill=255)
+    out = ImageOps.fit(img.convert("RGBA"), (size, size))
+    out.putalpha(big.resize((size, size), Image.LANCZOS))
+    return out
+
+
+def _ring(size: int, width: int, colour: tuple[int, int, int], alpha: int = 255) -> Image.Image:
+    big = Image.new("RGBA", (size * 4, size * 4), (0, 0, 0, 0))
+    ImageDraw.Draw(big).ellipse((0, 0, size * 4 - 1, size * 4 - 1), outline=colour + (alpha,), width=width * 4)
+    return big.resize((size, size), Image.LANCZOS)
+
+
+def render_welcome(avatar: bytes | None, background: bytes | None, name: str, username: str,
+                   server: str, member_number: int) -> tuple[bytes, tuple[int, int, int]]:
+    """Return (PNG bytes, accent RGB colour)."""
+    with _LOCK:
+        return _render_welcome(avatar, background, name, username, server, member_number)
+
+
+def _open(data: bytes | None) -> Image.Image | None:
+    if not data:
+        return None
+    try:
+        return Image.open(io.BytesIO(data)).convert("RGB")
+    except Exception as e:
+        log.warning("Bad image: %r", e)
+        return None
+
+
+def _render_welcome(avatar, background, name, username, server, member_number):
+    av = _open(avatar) or Image.new("RGB", (256, 256), (88, 101, 242))
+    accent = _accent(av)
+
+    # Background: server banner/icon (or the avatar) blurred and darkened, with the accent colour glowing
+    # behind the avatar
+    bg = ImageOps.fit(_open(background) or av, (WW, WH)).filter(ImageFilter.GaussianBlur(24))
+    card = ImageEnhance.Brightness(bg).enhance(0.38).convert("RGBA")
+    shade = Image.linear_gradient("L").resize((WW, WH)).point(lambda v: int(v * 0.6))  # darker towards the bottom
+    card.alpha_composite(Image.merge("RGBA", (*Image.new("RGB", (WW, WH), (8, 8, 12)).split(), shade)))
+
+    cx, cy, size = WW // 2, 140, 184
+    glow = Image.new("RGBA", (WW, WH), (0, 0, 0, 0))
+    ImageDraw.Draw(glow).ellipse((cx - 170, cy - 150, cx + 170, cy + 150), fill=accent + (150,))
+    card.alpha_composite(glow.filter(ImageFilter.GaussianBlur(55)))
+
+    # Thin rounded frame
+    frame = Image.new("RGBA", (WW, WH), (0, 0, 0, 0))
+    ImageDraw.Draw(frame).rounded_rectangle((14, 14, WW - 15, WH - 15), radius=26, outline=accent + (110,), width=3)
+    card.alpha_composite(frame)
+
+    # Avatar with accent ring + soft white inner ring
+    ring = size + 22
+    card.alpha_composite(_ring(ring, 6, accent), (cx - ring // 2, cy - ring // 2))
+    inner = size + 8
+    card.alpha_composite(_ring(inner, 2, (255, 255, 255), 170), (cx - inner // 2, cy - inner // 2))
+    card.alpha_composite(_circle(av, size), (cx - size // 2, cy - size // 2))
+
+    draw = ImageDraw.Draw(card)
+    # "WELCOME" pill
+    label = "WELCOME"
+    lw = _width(label, "bold", 16)
+    top = cy + ring // 2 + 16
+    draw.rounded_rectangle((cx - lw / 2 - 16, top, cx + lw / 2 + 16, top + 30), radius=15, fill=accent + (255,))
+    text_col = (20, 20, 24) if sum(accent) > 450 else (255, 255, 255)
+    _draw_text(card, (cx, top + 21), label, "bold", 16, text_col, anchor="ms")
+
+    _draw_text(card, (cx, top + 86), _fit(name, "bold", 46, WW - 160), "bold", 46, (255, 255, 255), anchor="ms")
+    _draw_text(card, (cx, top + 124), _fit(f"ยินดีต้อนรับสู่ {server}", "regular", 24, WW - 200), "regular", 24,
+               (225, 225, 235), anchor="ms")
+    _draw_text(card, (cx, top + 156), _fit(f"@{username}  •  สมาชิกคนที่ #{member_number:,}", "regular", 18, WW - 240),
+               "regular", 18, (170, 170, 185), anchor="ms")
+
+    out = io.BytesIO()
+    card.convert("RGB").save(out, "PNG", optimize=True)
+    return out.getvalue(), accent
