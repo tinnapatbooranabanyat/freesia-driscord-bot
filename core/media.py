@@ -44,9 +44,9 @@ def _extract(query: str, **extra) -> dict:
         with yt_dlp.YoutubeDL(_ytdl_opts(**extra)) as ydl:
             return ydl.extract_info(query, download=False)
     except yt_dlp.utils.DownloadError as e:
-        if "not a bot" not in str(e) or "cookiefile" not in _ytdl_opts(cookies=True):
+        if not any(s in str(e) for s in ("not a bot", "confirm your age")) or "cookiefile" not in _ytdl_opts(cookies=True):
             raise
-        log.info("YouTube bot check, retrying with cookies: %s", query)
+        log.info("YouTube asked to sign in (bot / age check), retrying with cookies: %s", query)
         with yt_dlp.YoutubeDL(_ytdl_opts(cookies=True, **extra)) as ydl:
             return ydl.extract_info(query, download=False)
 
