@@ -353,6 +353,17 @@ class GuildPlayer:
                         last_announced = track
                 await self._done.wait()
 
+                # The stream died right away (YouTube sometimes answers 403 for a stream URL, or it expired):
+                # fetch a fresh URL and try the song once more instead of silently skipping it
+                played = time.monotonic() - self._play_started
+                if (played < 3 and not self._skip and not self._jump and self._restart_at is None
+                        and not self._voice_lost() and (track.duration or 0) > 15 and not track.retried):
+                    log.info("Stream for %s ended after %.1fs, retrying with a fresh URL", track.title, played)
+                    track.retried = True
+                    track.stream_url = None
+                    self._restart_at = offset
+                    continue
+
                 if self._voice_lost() and self.current:
                     position = self.position
                     if await self._reconnect():

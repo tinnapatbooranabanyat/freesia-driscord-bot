@@ -20,7 +20,7 @@ MAX_MIX = 50  # YouTube Mixes (list=RD...) are endless; take the first songs onl
 STREAM_URL_TTL = 3 * 60 * 60  # YouTube stream URLs expire after ~6h; re-resolve well before that
 
 
-def _ytdl_opts(**extra) -> dict:
+def _ytdl_opts(cookies: bool = False, **extra) -> dict:
     opts = {
         "format": "bestaudio/best",
         "quiet": True,
@@ -29,17 +29,31 @@ def _ytdl_opts(**extra) -> dict:
         "skip_download": True,
         "source_address": "0.0.0.0",
     }
-    cookies = os.getenv("YTDL_COOKIES")
-    if cookies and os.path.isfile(cookies):
-        opts["cookiefile"] = cookies
+    cookie_file = os.getenv("YTDL_COOKIES")
+    if cookies and cookie_file and os.path.isfile(cookie_file):
+        opts["cookiefile"] = cookie_file
     opts.update(extra)
     return opts
 
 
+def _extract(query: str, **extra) -> dict:
+    """yt-dlp extract_info without cookies first; retry with YTDL_COOKIES only when YouTube asks
+    "Sign in to confirm you're not a bot". (Logged-in requests often get stream URLs that need a PO token
+    and fail with 403, so cookies are a fallback for blocks rather than the default.)"""
+    try:
+        with yt_dlp.YoutubeDL(_ytdl_opts(**extra)) as ydl:
+            return ydl.extract_info(query, download=False)
+    except yt_dlp.utils.DownloadError as e:
+        if "not a bot" not in str(e) or "cookiefile" not in _ytdl_opts(cookies=True):
+            raise
+        log.info("YouTube bot check, retrying with cookies: %s", query)
+        with yt_dlp.YoutubeDL(_ytdl_opts(cookies=True, **extra)) as ydl:
+            return ydl.extract_info(query, download=False)
+
+
 def extract_single(query: str) -> dict:
     """Fully resolve one video (URL or 'ytsearch1:...'), including the direct audio stream URL."""
-    with yt_dlp.YoutubeDL(_ytdl_opts()) as ydl:
-        info = ydl.extract_info(query, download=False)
+    info = _extract(query)
     if info and "entries" in info:
         info = next((e for e in info["entries"] if e), None)
     if not info or not info.get("url"):
@@ -68,10 +82,8 @@ def extract_query(query: str) -> tuple[str | None, list[dict]]:
     vid = video_id(query)
 
     limit = MAX_MIX if (list_id or "").startswith("RD") else MAX_PLAYLIST
-    opts = _ytdl_opts(extract_flat="in_playlist", noplaylist=not list_id, playlistend=limit)
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(query, download=False)
+        info = _extract(query, extract_flat="in_playlist", noplaylist=not list_id, playlistend=limit)
     except yt_dlp.utils.DownloadError:
         # Private / personal lists (Liked videos, Watch later...) can't be read: just play the video itself
         if not (list_id and vid):
@@ -94,8 +106,7 @@ def extract_query(query: str) -> tuple[str | None, list[dict]]:
 
 def search(query: str, count: int = 5) -> list[dict]:
     """Top YouTube results for a text query (flat: title / url / duration / channel, no stream URL)."""
-    with yt_dlp.YoutubeDL(_ytdl_opts(extract_flat="in_playlist", noplaylist=False)) as ydl:
-        info = ydl.extract_info(f"ytsearch{count}:{query}", download=False)
+    info = _extract(f"ytsearch{count}:{query}", extract_flat="in_playlist", noplaylist=False)
     return [e for e in (info or {}).get("entries") or [] if e and e.get("id")]
 
 
@@ -140,6 +151,7 @@ class Track:
     artist: str | None = None
     stream_url: str | None = None
     resolved_at: float = 0.0
+    retried: bool = False  # already re-fetched once after the stream failed to start
 
     @staticmethod
     def _artist(info: dict) -> str | None:
