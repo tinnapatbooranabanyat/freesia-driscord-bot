@@ -183,6 +183,8 @@ class Chat(commands.Cog):
             system = await self._system_message(where, guild_id)
             reply = await self.llm.chat([system, *history, {"role": "user", "content": text}])
             stored = text
+        # Some models copy the "Name: message" format we use for users and start with "Name:" themselves
+        reply.text = re.sub(rf"^\s*\**\s*{re.escape(author)}\s*\**\s*:\s*\**\s*", "", reply.text).strip() or reply.text
         await self.storage.add_history(
             channel_id, [{"role": "user", "content": stored}, {"role": "assistant", "content": reply.text}],
             keep=self.history_len,
