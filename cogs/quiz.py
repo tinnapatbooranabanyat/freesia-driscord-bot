@@ -241,18 +241,39 @@ class Game:
                 if not (music and self.guild.id in music.players):
                     await vc.disconnect(force=True)
 
-    async def _round(self, vc: discord.VoiceClient, number: int, song: Song, stream: str, volume: float) -> None:
+    async def _start_snippet(self, vc: discord.VoiceClient, song: Song, stream: str | None, volume: float) -> bool:
+        """Start the song excerpt and make sure it's actually audible. YouTube sometimes answers 403 for a stream
+        URL; then ffmpeg exits at once, so fetch a fresh URL and try again (3 attempts)."""
         duration = song.duration or 180
         start = random.uniform(0.25, 0.55) * duration
-        start = max(10.0, min(start, duration - SNIPPET - 5))
-        source = discord.FFmpegPCMAudio(
-            stream, executable=FFMPEG_PATH,
-            before_options=f"-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin -ss {start:.1f}",
-            options=f"-vn -t {SNIPPET + 1}",
-        )
-        if vc.is_playing():
-            vc.stop()
-        vc.play(discord.PCMVolumeTransformer(source, volume=volume))
+        start = max(10.0, min(start, duration - SNIPPET - 8))
+        loop = asyncio.get_running_loop()
+        for attempt in range(3):
+            if not stream:
+                stream = await self._stream(song)
+                if not stream:
+                    return False
+            ended = asyncio.Event()
+            source = discord.FFmpegPCMAudio(
+                stream, executable=FFMPEG_PATH,
+                before_options=f"-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin -ss {start:.1f}",
+                options=f"-vn -t {SNIPPET + 4}",
+            )
+            if vc.is_playing():
+                vc.stop()
+            vc.play(discord.PCMVolumeTransformer(source, volume=volume), after=lambda e: loop.call_soon_threadsafe(ended.set))
+            try:
+                await asyncio.wait_for(ended.wait(), timeout=2.5)
+            except asyncio.TimeoutError:
+                return True  # still playing after 2.5s: the stream works
+            log.info("Quiz stream for %s died at once (attempt %d), fetching a fresh URL", song.url, attempt + 1)
+            stream = None
+        return False
+
+    async def _round(self, vc: discord.VoiceClient, number: int, song: Song, stream: str, volume: float) -> None:
+        if not await self._start_snippet(vc, song, stream, volume):
+            await self.channel.send(f"⚠️ รอบที่ {number}: เปิดเพลงนี้ไม่ได้ (YouTube ไม่ตอบ) ข้ามไปเพลงถัดไปนะ")
+            return
 
         embed = discord.Embed(
             title=f"🎵 รอบที่ {number}/{len(self.songs)} — เพลงนี้ชื่ออะไร?",
