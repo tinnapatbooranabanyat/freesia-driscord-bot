@@ -34,6 +34,7 @@ IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT") or 180)
 DEFAULT_VOLUME = int(os.getenv("DEFAULT_VOLUME") or 50)
 FFMPEG_BEFORE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin"
 NO_PINGS = discord.AllowedMentions.none()
+PROGRESS_INTERVAL = 10  # seconds between now-playing card redraws
 LOOP_LABELS = {"off": "ปิด", "track": "วนเพลงนี้", "queue": "วนทั้งคิว"}
 MAX_SAVED_TRACKS = 500
 MAX_PLAYLISTS_PER_USER = 25
@@ -80,6 +81,11 @@ class GuildPlayer:
         self._last_reconnect = 0.0
         self._interrupts: deque[bytes] = deque()  # TTS clips to play before continuing the music
         self.np_message: discord.Message | None = None  # the one "now playing" card kept in the chat
+        self.np_view: discord.ui.LayoutView | None = None
+        self.np_status: str | None = None  # last action shown at the bottom of the card ("⏸️ X หยุดชั่วคราว")
+        self.next_status: str | None = None  # status for the next card (e.g. who skipped)
+        self.np_lock = asyncio.Lock()  # one card send/edit at a time
+        self.thumb_cache: tuple[str | None, bytes | None] = (None, None)
         self._wake = asyncio.Event()
         self._done = asyncio.Event()
         self._skip = False
@@ -90,6 +96,22 @@ class GuildPlayer:
         self._play_started = 0.0  # monotonic time it started, shifted forward by pauses
         self._paused_at: float | None = None
         self.task = asyncio.create_task(self._run())
+        self.progress_task = asyncio.create_task(self._progress_loop())
+
+    async def _progress_loop(self) -> None:
+        """Re-render the card every few seconds so its progress bar and time move along with the song."""
+        while True:
+            await asyncio.sleep(PROGRESS_INTERVAL)
+            vc = self.guild.voice_client
+            if self.np_message and self.current and vc and vc.is_playing():
+                try:
+                    await self.cog.update_now_playing(self)
+                except Exception as e:
+                    log.info("Progress update failed: %r", e)
+
+    @property
+    def is_paused(self) -> bool:
+        return self._paused_at is not None
 
     # ---------- controls ----------
 
@@ -387,46 +409,171 @@ class GuildPlayer:
 _INTERRUPT = Track(title="<interrupt>", requester=None)  # sentinel returned by _next_track when only TTS is pending
 
 
-class NowPlayingView(discord.ui.View):
-    def __init__(self, cog: Music):
-        super().__init__(timeout=3600)
+class NowPlayingCard(discord.ui.LayoutView):
+    """The "now playing" message: one Components V2 container with the song info, the big banner image,
+    what's next, and the player buttons. Buttons update this card in place instead of posting new messages."""
+
+    IMAGE = "nowplaying.jpg"
+
+    def __init__(self, cog: Music, player: GuildPlayer, accent: tuple[int, int, int] | None, has_image: bool):
+        super().__init__(timeout=6 * 3600)
         self.cog = cog
+        self.player = player
+        t = player.current
+        colour = discord.Colour.from_rgb(*accent) if accent else discord.Colour.blurple()
+        container = discord.ui.Container(accent_colour=colour)
 
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        return await self.cog.get_player(interaction) is not None
+        title = t.title.replace("[", "(").replace("]", ")")
+        link = f"[{title}](<{t.url}>)" if t.url else title  # <url>: no YouTube preview under the card
+        vc = player.guild.voice_client
+        where = f" • 🔊 {vc.channel.name}" if vc and getattr(vc, "channel", None) else ""
+        container.add_item(discord.ui.TextDisplay(f"### 🎶 {link}\n-# 🎧 ขอโดย **{t.requester.display_name}**{where}"))
 
-    @discord.ui.button(emoji="⏯️", style=discord.ButtonStyle.secondary)
-    async def toggle(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        player = self.cog.players[interaction.guild_id]
+        if has_image:
+            container.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem(f"attachment://{self.IMAGE}")))
+        else:
+            container.add_item(discord.ui.TextDisplay(f"⏱️ {fmt_duration(t.duration)}"))
+
+        info = []
+        if player.queue:
+            nxt = player.queue[0].title
+            info.append(f"**⏭️ ถัดไป** · {nxt[:70] + ('…' if len(nxt) > 70 else '')}")
+        else:
+            info.append("**⏭️ ถัดไป** · " + ("🔄 Autoplay จะหาเพลงแนวเดียวกันให้" if player.autoplay else "_ไม่มีเพลงในคิว_"))
+        extras = []
+        if player.queue:
+            total = sum(x.duration or 0 for x in player.queue)
+            extras.append(f"📜 คิว {len(player.queue)} เพลง · {fmt_duration(total)}")
+        if player.loop_mode != "off":
+            extras.append(f"🔁 {LOOP_LABELS[player.loop_mode]}")
+        if player.filter != "off":
+            extras.append(f"🎛️ {FILTERS[player.filter].label}")
+        extras.append(f"🔊 {round(player.volume * 100)}%")
+        info.append("-# " + "  •  ".join(extras))
+        container.add_item(discord.ui.TextDisplay("\n".join(info)))
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+
+        paused = player.is_paused
+        controls = discord.ui.ActionRow()
+        controls.add_item(self._button("⏮️", discord.ButtonStyle.secondary, self.on_previous))
+        controls.add_item(self._button("▶️" if paused else "⏸️",
+                                       discord.ButtonStyle.success if paused else discord.ButtonStyle.primary, self.on_pause))
+        controls.add_item(self._button("⏭️", discord.ButtonStyle.secondary, self.on_skip))
+        controls.add_item(self._button("⏹️", discord.ButtonStyle.danger, self.on_stop))
+        container.add_item(controls)
+
+        extra = discord.ui.ActionRow()
+        on = discord.ButtonStyle.success
+        off = discord.ButtonStyle.secondary
+        extra.add_item(self._button("🔁", on if player.loop_mode != "off" else off, self.on_loop,
+                                    f"วน: {LOOP_LABELS[player.loop_mode]}"))
+        extra.add_item(self._button("🔀", off, self.on_shuffle, "สลับ"))
+        extra.add_item(self._button("🔄", on if player.autoplay else off, self.on_autoplay, "Autoplay"))
+        extra.add_item(self._button("📜", off, self.on_queue, "คิว"))
+        extra.add_item(self._button("🎤", off, self.on_lyrics, "เนื้อเพลง"))
+        container.add_item(extra)
+
+        if player.np_status:
+            container.add_item(discord.ui.TextDisplay(f"-# {player.np_status}"))
+        self.add_item(container)
+
+    @staticmethod
+    def _button(emoji: str, style: discord.ButtonStyle, callback, label: str | None = None) -> discord.ui.Button:
+        button = discord.ui.Button(emoji=emoji, style=style, label=label)
+        button.callback = callback
+        return button
+
+    async def _controllable(self, interaction: discord.Interaction) -> GuildPlayer | None:
+        player = await self.cog.get_player(interaction)  # replies with the reason if not allowed
+        if player is not self.player or not player.current:
+            if player is not None:
+                await interaction.response.send_message("การ์ดนี้เป็นของเพลงที่จบไปแล้ว", ephemeral=True)
+            return None
+        return player
+
+    async def _refresh(self, interaction: discord.Interaction, status: str | None) -> None:
+        self.player.np_status = status
+        await self.cog.refresh_now_playing(self.player, interaction)
+
+    async def on_previous(self, interaction: discord.Interaction) -> None:
+        player = await self._controllable(interaction)
+        if not player:
+            return
+        if player.current.requester.id != interaction.user.id and not self.cog.is_dj(interaction.user, interaction.guild.voice_client):
+            await interaction.response.send_message("ย้อนเพลงได้เฉพาะคนที่ขอเพลงนี้ หรือ DJ", ephemeral=True)
+            return
+        prev = player.play_previous()
+        if not prev:
+            await interaction.response.send_message("ยังไม่มีเพลงก่อนหน้า", ephemeral=True)
+            return
+        player.next_status = f"⏮️ {interaction.user.display_name} ย้อนกลับมาเพลงก่อนหน้า"
+        await interaction.response.defer()  # the next song posts a fresh card
+
+    async def on_pause(self, interaction: discord.Interaction) -> None:
+        player = await self._controllable(interaction)
+        if not player:
+            return
         if player.resume():
-            text = "▶️ เล่นต่อ"
+            await self._refresh(interaction, f"▶️ {interaction.user.display_name} เล่นต่อ")
         elif player.pause():
-            text = "⏸️ หยุดชั่วคราว"
+            await self._refresh(interaction, f"⏸️ {interaction.user.display_name} หยุดชั่วคราว")
         else:
             await interaction.response.send_message("ไม่มีเพลงที่กำลังเล่นอยู่", ephemeral=True)
+
+    async def on_skip(self, interaction: discord.Interaction) -> None:
+        player = await self._controllable(interaction)
+        if not player:
             return
-        await interaction.response.send_message(f"{text} โดย {interaction.user.display_name}", allowed_mentions=NO_PINGS)
+        text, skipped = self.cog.skip_action(interaction.user, player)
+        if skipped:
+            player.next_status = text
+            await interaction.response.defer()
+        else:
+            await self._refresh(interaction, text)
 
-    @discord.ui.button(emoji="⏭️", style=discord.ButtonStyle.secondary)
-    async def skip(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await self.cog.handle_skip(interaction, self.cog.players[interaction.guild_id])
-
-    @discord.ui.button(emoji="🔁", style=discord.ButtonStyle.secondary)
-    async def loop(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        player = self.cog.players[interaction.guild_id]
-        player.loop_mode = {"off": "track", "track": "queue", "queue": "off"}[player.loop_mode]
-        await interaction.response.send_message(f"🔁 โหมดวนซ้ำ: **{LOOP_LABELS[player.loop_mode]}**")
-
-    @discord.ui.button(emoji="🔄", style=discord.ButtonStyle.secondary)
-    async def autoplay(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await self.cog.set_autoplay(interaction, None)
-
-    @discord.ui.button(emoji="⏹️", style=discord.ButtonStyle.danger)
-    async def stop_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        if not await self.cog.require_dj(interaction):
+    async def on_stop(self, interaction: discord.Interaction) -> None:
+        player = await self._controllable(interaction)
+        if not player or not await self.cog.require_dj(interaction):
             return
-        await interaction.response.send_message(f"⏹️ หยุดเล่นและออกจากห้อง โดย {interaction.user.display_name}", allowed_mentions=NO_PINGS)
+        await interaction.response.send_message(f"⏹️ **{interaction.user.display_name}** หยุดเพลงและให้บอทออกจากห้องแล้ว",
+                                                allowed_mentions=NO_PINGS)
         await self.cog.destroy(interaction.guild)
+
+    async def on_loop(self, interaction: discord.Interaction) -> None:
+        player = await self._controllable(interaction)
+        if not player:
+            return
+        player.loop_mode = {"off": "track", "track": "queue", "queue": "off"}[player.loop_mode]
+        await self._refresh(interaction, f"🔁 {interaction.user.display_name} ตั้งวนซ้ำ: {LOOP_LABELS[player.loop_mode]}")
+
+    async def on_shuffle(self, interaction: discord.Interaction) -> None:
+        player = await self._controllable(interaction)
+        if not player:
+            return
+        random.shuffle(player.queue)
+        await self._refresh(interaction, f"🔀 {interaction.user.display_name} สลับลำดับ {len(player.queue)} เพลงในคิว")
+
+    async def on_autoplay(self, interaction: discord.Interaction) -> None:
+        player = await self._controllable(interaction)
+        if not player:
+            return
+        player.autoplay = not player.autoplay
+        await self.cog.storage.set_setting(interaction.guild_id, "autoplay", "1" if player.autoplay else "0")
+        await self._refresh(interaction, f"🔄 {interaction.user.display_name} "
+                                         f"{'เปิด' if player.autoplay else 'ปิด'} Autoplay")
+
+    async def on_queue(self, interaction: discord.Interaction) -> None:
+        view = QueueView(self.cog, interaction.guild_id)
+        await interaction.response.send_message(embed=view.render(self.cog.players.get(interaction.guild_id)),
+                                                view=view, ephemeral=True)
+
+    async def on_lyrics(self, interaction: discord.Interaction) -> None:
+        track = self.player.current
+        if not track:
+            await interaction.response.send_message("ไม่มีเพลงที่กำลังเล่นอยู่", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await self.cog.send_lyrics(interaction, track.title, track.artist, track.duration, ephemeral=True)
 
 
 class QueueView(discord.ui.View):
@@ -658,6 +805,9 @@ class Music(commands.Cog):
             player.queue.clear()
             if player.task is not asyncio.current_task():
                 player.task.cancel()
+            player.progress_task.cancel()
+            if player.np_view:
+                player.np_view.stop()
             await self.delete_message(player.np_message)  # the card's buttons would be dead anyway
             player.np_message = None
         if forget:
@@ -703,27 +853,30 @@ class Music(commands.Cog):
             "🎧 คำสั่งนี้ใช้ได้เฉพาะคนที่มียศ **DJ**, แอดมิน หรือตอนที่อยู่ในห้องคนเดียว", ephemeral=True)
         return False
 
-    async def handle_skip(self, interaction: discord.Interaction, player: GuildPlayer) -> None:
-        if not player.current:
-            await interaction.response.send_message("ไม่มีเพลงให้ข้าม", ephemeral=True)
-            return
-        member, vc = interaction.user, interaction.guild.voice_client
-        title = player.current.title
+    def skip_action(self, member: discord.Member, player: GuildPlayer) -> tuple[str, bool]:
+        """Skip now (DJ / requester) or count a vote. Returns (text to show, skipped?)."""
+        vc = member.guild.voice_client
+        title = player.current.title[:80]
         if self.is_dj(member, vc) or player.current.requester.id == member.id:
             player.skip()
-            await interaction.response.send_message(f"⏭️ ข้าม **{title}** โดย {member.display_name}", allowed_mentions=NO_PINGS)
-            return
+            return f"⏭️ {member.display_name} ข้ามเพลง {title}", True
         listeners = {m.id for m in vc.channel.members if not m.bot}
         player.skip_votes &= listeners
         player.skip_votes.add(member.id)
         needed = math.ceil(len(listeners) / 2)
         if len(player.skip_votes) >= needed:
             player.skip()
-            await interaction.response.send_message(f"🗳️ โหวตครบ {needed} คน — ข้าม **{title}** แล้ว")
-        else:
-            await interaction.response.send_message(
-                f"🗳️ {member.display_name} โหวตข้ามเพลง ({len(player.skip_votes)}/{needed}) — กด ⏭️ หรือ `/skip` เพื่อโหวต",
-                allowed_mentions=NO_PINGS)
+            return f"🗳️ โหวตครบ {needed} คน — ข้ามเพลง {title}", True
+        return f"🗳️ {member.display_name} โหวตข้ามเพลง ({len(player.skip_votes)}/{needed}) — กด ⏭️ เพื่อโหวตด้วย", False
+
+    async def handle_skip(self, interaction: discord.Interaction, player: GuildPlayer) -> None:
+        if not player.current:
+            await interaction.response.send_message("ไม่มีเพลงให้ข้าม", ephemeral=True)
+            return
+        text, skipped = self.skip_action(interaction.user, player)
+        if skipped:
+            player.next_status = text
+        await interaction.response.send_message(text, allowed_mentions=NO_PINGS)
 
     async def set_autoplay(self, interaction: discord.Interaction, enabled: bool | None) -> None:
         player = self.players.get(interaction.guild_id)
@@ -892,48 +1045,69 @@ class Music(commands.Cog):
             log.info("Thumbnail fetch failed: %r", e)
         return None
 
-    async def now_playing_message(self, player: GuildPlayer, position: float = 0.0) -> dict:
-        """Kwargs for channel.send / followup.send: the banner image as a plain attachment (Discord shows those
-        bigger than images inside an embed), with the details as text. Falls back to an embed without the image."""
+    async def _card(self, player: GuildPlayer, position: float) -> tuple[NowPlayingCard, discord.File | None]:
+        """Render the banner for the current song and build the card around it."""
         t = player.current
-        title = t.title.replace("[", "(").replace("]", ")")
-        heading = f"🎶 **[{title}](<{t.url}>)**" if t.url else f"🎶 **{title}**"  # <url>: no YouTube preview
-        details = [f"ขอโดย {t.requester.display_name}"]
-        if player.queue:
-            details.append(f"ถัดไป: {player.queue[0].title[:60]}")
-            details.append(f"คิว {len(player.queue)} เพลง")
-        if player.loop_mode != "off":
-            details.append(f"🔁 {LOOP_LABELS[player.loop_mode]}")
-        if player.filter != "off":
-            details.append(FILTERS[player.filter].label)
-        if player.autoplay:
-            details.append("🔄 Autoplay")
-        kwargs: dict = {"content": f"{heading}\n-# {'  •  '.join(details)}", "view": NowPlayingView(self)}
-
+        url, data = player.thumb_cache
+        if url != t.thumbnail:
+            data = await self._fetch_image(t.thumbnail)
+            player.thumb_cache = (t.thumbnail, data)
         try:
-            thumb = await self._fetch_image(t.thumbnail)
-            png, _ = await asyncio.get_running_loop().run_in_executor(
-                None, render_card, thumb, t.card_title, t.artist, t.duration, position, None
+            jpg, accent = await asyncio.get_running_loop().run_in_executor(
+                None, render_card, data, t.card_title, t.artist, t.duration, position, None,
+                "PAUSED" if player.is_paused else "NOW PLAYING",
             )
-            kwargs["file"] = discord.File(io.BytesIO(png), filename="nowplaying.png")
         except Exception:
             log.exception("Could not render now-playing card")
-            embed = discord.Embed(color=discord.Color.blurple())
-            embed.add_field(name="ความยาว", value=fmt_duration(t.duration))
-            if t.thumbnail:
-                embed.set_thumbnail(url=t.thumbnail)
-            kwargs["embed"] = embed
-        return kwargs
+            return NowPlayingCard(self, player, None, has_image=False), None
+        return NowPlayingCard(self, player, accent, has_image=True), discord.File(io.BytesIO(jpg), filename=NowPlayingCard.IMAGE)
+
+    def _swap_view(self, player: GuildPlayer, view: NowPlayingCard) -> None:
+        if player.np_view is not None and player.np_view is not view:
+            player.np_view.stop()  # stop listening for clicks on the old card
+        player.np_view = view
+
+    async def refresh_now_playing(self, player: GuildPlayer, interaction: discord.Interaction) -> None:
+        """Redraw the card a button was pressed on (in place)."""
+        async with player.np_lock:
+            view, file = await self._card(player, player.position)
+            await interaction.response.edit_message(view=view, attachments=[file] if file else [])
+            player.np_message = interaction.message
+            self._swap_view(player, view)
+
+    async def update_now_playing(self, player: GuildPlayer) -> None:
+        """Periodic redraw (moving progress bar)."""
+        async with player.np_lock:
+            message = player.np_message
+            if message is None or not player.current:
+                return
+            view, file = await self._card(player, player.position)
+            try:
+                await message.edit(view=view, attachments=[file] if file else [])
+            except discord.NotFound:
+                if player.np_message is message:
+                    player.np_message = None
+                return
+            self._swap_view(player, view)
+
+    async def now_playing_message(self, player: GuildPlayer, position: float = 0.0) -> dict:
+        """Kwargs for channel.send: the Components V2 card (+ its banner image)."""
+        view, file = await self._card(player, position)
+        return {"view": view, "file": file} if file else {"view": view}
 
     async def post_now_playing(self, player: GuildPlayer, position: float = 0.0) -> None:
         """Send the now-playing card and delete the previous one, so the chat only shows the current song."""
-        old, player.np_message = player.np_message, None
-        try:
-            player.np_message = await player.channel.send(allowed_mentions=NO_PINGS,
-                                                          **await self.now_playing_message(player, position))
-        except discord.HTTPException as e:
-            log.warning("Could not send now-playing message: %r", e)
-        await self.delete_message(old)
+        async with player.np_lock:
+            player.np_status, player.next_status = player.next_status, None
+            old, player.np_message = player.np_message, None
+            view, file = await self._card(player, position)
+            try:
+                player.np_message = await player.channel.send(view=view, file=file, allowed_mentions=NO_PINGS) if file \
+                    else await player.channel.send(view=view, allowed_mentions=NO_PINGS)
+                self._swap_view(player, view)
+            except discord.HTTPException as e:
+                log.warning("Could not send now-playing message: %r", e)
+            await self.delete_message(old)
 
     @staticmethod
     async def delete_message(message: discord.Message | None) -> None:
@@ -1069,9 +1243,15 @@ class Music(commands.Cog):
             await interaction.response.send_message("ไม่มีเพลงที่กำลังเล่น ใส่ชื่อเพลงที่อยากดูเนื้อได้เลย เช่น `/lyrics song:...`", ephemeral=True)
             return
         await interaction.response.defer(thinking=True)
+        await self.send_lyrics(interaction, title, artist, duration)
+
+    async def send_lyrics(self, interaction: discord.Interaction, title: str, artist: str | None,
+                          duration: float | None, ephemeral: bool = False) -> None:
+        """Look up lyrics and reply (after defer) with paged embeds."""
         result = await find_lyrics(title, artist, duration)
         if not result:
-            await interaction.followup.send(f"😢 ไม่พบเนื้อเพลง **{title[:100]}** — ลองพิมพ์ชื่อเพลงเองด้วย `/lyrics song:ศิลปิน ชื่อเพลง`")
+            await interaction.followup.send(f"😢 ไม่พบเนื้อเพลง **{title[:100]}** — ลองพิมพ์ชื่อเพลงเองด้วย `/lyrics song:ศิลปิน ชื่อเพลง`",
+                                            ephemeral=ephemeral)
             return
         chunks = _chunk_lines(result.text)
         pages = []
@@ -1080,10 +1260,10 @@ class Music(commands.Cog):
             e.set_footer(text=f"หน้า {i}/{len(chunks)} • เนื้อเพลงจาก lrclib.net")
             pages.append(e)
         if len(pages) == 1:
-            await interaction.followup.send(embed=pages[0])
+            await interaction.followup.send(embed=pages[0], ephemeral=ephemeral)
         else:
             view = PagedView(pages)
-            view.message = await interaction.followup.send(embed=pages[0], view=view, wait=True)
+            view.message = await interaction.followup.send(embed=pages[0], view=view, wait=True, ephemeral=ephemeral)
 
     # ---------- queue commands ----------
 
@@ -1104,11 +1284,8 @@ class Music(commands.Cog):
         if not player or not player.current:
             await interaction.response.send_message("ตอนนี้ไม่ได้เล่นเพลงอยู่", ephemeral=True)
             return
-        await interaction.response.defer()
-        old, player.np_message = player.np_message, None
-        player.np_message = await interaction.followup.send(
-            wait=True, **await self.now_playing_message(player, position=player.position))
-        await self.delete_message(old)  # keep a single now-playing card in the chat
+        await interaction.response.send_message("🎶 ส่งการ์ดเพลงที่กำลังเล่นไว้ล่างสุดแล้ว", ephemeral=True)
+        await self.post_now_playing(player, position=player.position)
 
     @app_commands.command(name="volume", description="ปรับระดับเสียง (0-150)")
     @app_commands.describe(level="ระดับเสียง 0-150")

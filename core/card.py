@@ -231,7 +231,7 @@ def render_card(
     footer: str | None = None,
     label: str = "NOW PLAYING",
 ) -> tuple[bytes, tuple[int, int, int]]:
-    """Return (PNG bytes, accent RGB colour)."""
+    """Return (JPEG bytes, accent RGB colour)."""
     with _LOCK:
         return _render(thumbnail, title, artist, duration, position, footer, label)
 
@@ -299,7 +299,8 @@ def _render(thumbnail, title, artist, duration, position, footer, label):
         _draw_text(card, (x + max_w / 2, bar_y + 44), footer, "regular", 20, (170, 170, 180), anchor="ms")
 
     out = io.BytesIO()
-    card.convert("RGB").save(out, "PNG", optimize=True)
+    # JPEG: ~4x smaller than PNG, which matters because the card is re-uploaded every few seconds
+    card.convert("RGB").save(out, "JPEG", quality=90, optimize=True)
     return out.getvalue(), accent
 
 
