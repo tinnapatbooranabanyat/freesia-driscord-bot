@@ -389,3 +389,11 @@ def _render_welcome(avatar, background, name, username, server, member_number):
     out = io.BytesIO()
     card.convert("RGB").save(out, "PNG", optimize=True)
     return out.getvalue(), accent
+
+
+def circle_png(data: bytes, size: int = 128) -> bytes:
+    """Round avatar PNG (used for the bot-avatar emoji in the card header)."""
+    img = _open(data) or Image.new("RGB", (size, size), (88, 101, 242))
+    out = io.BytesIO()
+    _circle(img, size).save(out, "PNG")
+    return out.getvalue()

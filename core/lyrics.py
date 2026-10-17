@@ -127,3 +127,63 @@ async def find_lyrics(title: str, artist: str | None = None, duration: float | N
             return Lyrics(best.get("trackName") or song, best.get("artistName") or artist or "", text.strip(),
                           bool(best.get("syncedLyrics")))
     return None
+
+
+# ---------------------------------------------------------------------------
+# Time-synced lyrics (for the live lyrics on the now-playing card)
+# ---------------------------------------------------------------------------
+
+_LRC_LINE = re.compile(r"^\[(\d+):(\d+(?:\.\d+)?)\](.*)$")
+MAX_DURATION_DIFF = 6  # seconds: a bigger difference usually means an MV with an intro -> timing would be off
+
+
+@dataclass
+class SyncedLyrics:
+    title: str
+    artist: str
+    lines: list[tuple[float, str]]  # (start second, text); "" = instrumental gap
+
+    def index_at(self, position: float) -> int:
+        """Index of the line being sung at `position` (-1 before the first line)."""
+        lo, hi = 0, len(self.lines)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self.lines[mid][0] <= position:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo - 1
+
+
+def parse_lrc(text: str) -> list[tuple[float, str]]:
+    lines = []
+    for raw in text.splitlines():
+        m = _LRC_LINE.match(raw.strip())
+        if m:
+            lines.append((int(m.group(1)) * 60 + float(m.group(2)), m.group(3).strip()))
+    return sorted(lines)
+
+
+async def find_synced(title: str, artist: str | None, duration: float | None) -> SyncedLyrics | None:
+    """Synced (LRC) lyrics whose length matches the playing track, or None."""
+    song, artist = clean_title(title, artist)
+    queries = []
+    for name in _variants(song):
+        if artist:
+            queries.append({"track_name": name, "artist_name": artist})
+            queries.append({"q": f"{artist} {name}"})
+    queries.append({"q": song})
+
+    async with aiohttp.ClientSession(headers=HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as session:
+        for params in queries:
+            results = [r for r in await _search(session, params) if r.get("syncedLyrics")]
+            if not results:
+                continue
+            if duration:
+                results.sort(key=lambda r: abs((r.get("duration") or 0) - duration))
+                if abs((results[0].get("duration") or 0) - duration) > MAX_DURATION_DIFF:
+                    continue
+            lines = parse_lrc(results[0]["syncedLyrics"])
+            if len(lines) >= 3:
+                return SyncedLyrics(results[0].get("trackName") or song, results[0].get("artistName") or artist or "", lines)
+    return None
