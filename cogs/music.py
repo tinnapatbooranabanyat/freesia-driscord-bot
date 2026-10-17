@@ -79,6 +79,7 @@ class GuildPlayer:
         self.leaving = False  # set by Music.destroy: an intentional disconnect, don't reconnect
         self._last_reconnect = 0.0
         self._interrupts: deque[bytes] = deque()  # TTS clips to play before continuing the music
+        self.np_message: discord.Message | None = None  # the one "now playing" card kept in the chat
         self._wake = asyncio.Event()
         self._done = asyncio.Event()
         self._skip = False
@@ -191,6 +192,7 @@ class GuildPlayer:
             "queue": [dump(t) for t in self.queue[:MAX_SAVED_TRACKS]],
             "loop": self.loop_mode,
             "filter": self.filter,
+            "np_message": self.np_message.id if self.np_message else None,
         }
 
     async def _send(self, content: str | None = None, **kwargs) -> None:
@@ -349,7 +351,7 @@ class GuildPlayer:
                     if track.video_id:
                         self.played_ids.append(track.video_id)
                     if track is not last_announced:
-                        await self._send(**await self.cog.now_playing_message(self, position=offset))
+                        await self.cog.post_now_playing(self, position=offset)
                         last_announced = track
                 await self._done.wait()
 
@@ -656,6 +658,8 @@ class Music(commands.Cog):
             player.queue.clear()
             if player.task is not asyncio.current_task():
                 player.task.cancel()
+            await self.delete_message(player.np_message)  # the card's buttons would be dead anyway
+            player.np_message = None
         if forget:
             await self.storage.set_setting(guild.id, "player_state", None)
         if guild.voice_client:
@@ -853,6 +857,8 @@ class Music(commands.Cog):
             await self.storage.set_setting(guild_id, "player_state", None)  # nobody left to listen
             return
         text = guild.get_channel(state.get("text") or 0) or channel
+        if state.get("np_message") and hasattr(text, "get_partial_message"):
+            await self.delete_message(text.get_partial_message(state["np_message"]))  # old card, dead buttons
 
         def load(d: dict) -> Track:
             return Track.from_dict(d, guild.get_member(d.get("requester_id") or 0) or guild.me)
@@ -887,38 +893,56 @@ class Music(commands.Cog):
         return None
 
     async def now_playing_message(self, player: GuildPlayer, position: float = 0.0) -> dict:
-        """Kwargs for channel.send / followup.send: an embed with a rendered banner image (falls back to a plain embed)."""
+        """Kwargs for channel.send / followup.send: the banner image as a plain attachment (Discord shows those
+        bigger than images inside an embed), with the details as text. Falls back to an embed without the image."""
         t = player.current
-        embed = discord.Embed(description=f"🎶 **{t.link}**", color=discord.Color.blurple())
-        footer = []
+        title = t.title.replace("[", "(").replace("]", ")")
+        heading = f"🎶 **[{title}](<{t.url}>)**" if t.url else f"🎶 **{title}**"  # <url>: no YouTube preview
+        details = [f"ขอโดย {t.requester.display_name}"]
         if player.queue:
-            footer.append(f"ถัดไป: {player.queue[0].title[:70]}")
+            details.append(f"ถัดไป: {player.queue[0].title[:60]}")
+            details.append(f"คิว {len(player.queue)} เพลง")
         if player.loop_mode != "off":
-            footer.append(f"🔁 {LOOP_LABELS[player.loop_mode]}")
+            details.append(f"🔁 {LOOP_LABELS[player.loop_mode]}")
         if player.filter != "off":
-            footer.append(FILTERS[player.filter].label)
+            details.append(FILTERS[player.filter].label)
         if player.autoplay:
-            footer.append("🔄 Autoplay")
-        if footer:
-            embed.set_footer(text="  •  ".join(footer))
-        kwargs: dict = {"embed": embed, "view": NowPlayingView(self)}
+            details.append("🔄 Autoplay")
+        kwargs: dict = {"content": f"{heading}\n-# {'  •  '.join(details)}", "view": NowPlayingView(self)}
 
-        card_footer = f"ขอโดย {t.requester.display_name}" + (f" • คิว {len(player.queue)} เพลง" if player.queue else "")
         try:
             thumb = await self._fetch_image(t.thumbnail)
-            png, accent = await asyncio.get_running_loop().run_in_executor(
-                None, render_card, thumb, t.card_title, t.artist, t.duration, position, card_footer
+            png, _ = await asyncio.get_running_loop().run_in_executor(
+                None, render_card, thumb, t.card_title, t.artist, t.duration, position, None
             )
-            embed.color = discord.Color.from_rgb(*accent)
-            embed.set_image(url="attachment://nowplaying.png")
             kwargs["file"] = discord.File(io.BytesIO(png), filename="nowplaying.png")
         except Exception:
             log.exception("Could not render now-playing card")
+            embed = discord.Embed(color=discord.Color.blurple())
             embed.add_field(name="ความยาว", value=fmt_duration(t.duration))
-            embed.add_field(name="ขอโดย", value=t.requester.mention)
             if t.thumbnail:
                 embed.set_thumbnail(url=t.thumbnail)
+            kwargs["embed"] = embed
         return kwargs
+
+    async def post_now_playing(self, player: GuildPlayer, position: float = 0.0) -> None:
+        """Send the now-playing card and delete the previous one, so the chat only shows the current song."""
+        old, player.np_message = player.np_message, None
+        try:
+            player.np_message = await player.channel.send(allowed_mentions=NO_PINGS,
+                                                          **await self.now_playing_message(player, position))
+        except discord.HTTPException as e:
+            log.warning("Could not send now-playing message: %r", e)
+        await self.delete_message(old)
+
+    @staticmethod
+    async def delete_message(message: discord.Message | None) -> None:
+        if message is None:
+            return
+        try:
+            await message.delete()
+        except discord.HTTPException:
+            pass  # already deleted, or no permission
 
     # ---------- playback commands ----------
 
@@ -1081,7 +1105,10 @@ class Music(commands.Cog):
             await interaction.response.send_message("ตอนนี้ไม่ได้เล่นเพลงอยู่", ephemeral=True)
             return
         await interaction.response.defer()
-        await interaction.followup.send(**await self.now_playing_message(player, position=player.position))
+        old, player.np_message = player.np_message, None
+        player.np_message = await interaction.followup.send(
+            wait=True, **await self.now_playing_message(player, position=player.position))
+        await self.delete_message(old)  # keep a single now-playing card in the chat
 
     @app_commands.command(name="volume", description="ปรับระดับเสียง (0-150)")
     @app_commands.describe(level="ระดับเสียง 0-150")

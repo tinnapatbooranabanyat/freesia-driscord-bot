@@ -21,8 +21,8 @@ from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps, ImageStat
 
 log = logging.getLogger(__name__)
 
-W, H = 1000, 300
-THUMB_W, THUMB_H = 368, 207  # 16:9 like YouTube thumbnails
+W, H = 1000, 380
+THUMB_W, THUMB_H = 448, 252  # 16:9 like YouTube thumbnails
 PAD = 40
 
 _WIN = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
@@ -258,9 +258,9 @@ def _render(thumbnail, title, artist, duration, position, footer, label):
     tx, ty = PAD, (H - THUMB_H) // 2
     art = ImageOps.fit(thumb, (THUMB_W, THUMB_H)).convert("RGBA")
     mask = Image.new("L", (THUMB_W, THUMB_H), 0)
-    ImageDraw.Draw(mask).rounded_rectangle((0, 0, THUMB_W, THUMB_H), radius=18, fill=255)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, THUMB_W, THUMB_H), radius=22, fill=255)
     shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    ImageDraw.Draw(shadow).rounded_rectangle((tx + 4, ty + 8, tx + THUMB_W + 4, ty + THUMB_H + 8), radius=18, fill=(0, 0, 0, 150))
+    ImageDraw.Draw(shadow).rounded_rectangle((tx + 4, ty + 10, tx + THUMB_W + 4, ty + THUMB_H + 10), radius=22, fill=(0, 0, 0, 160))
     card.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(10)))
     card.paste(art, (tx, ty), mask)
 
@@ -269,34 +269,34 @@ def _render(thumbnail, title, artist, duration, position, footer, label):
     max_w = W - x - PAD
 
     # Label pill
-    lw = _width(label, "bold", 15)
-    draw.rounded_rectangle((x, 46, x + lw + 24, 74), radius=14, fill=accent + (255,))
+    lw = _width(label, "bold", 19)
+    draw.rounded_rectangle((x, 56, x + lw + 30, 92), radius=18, fill=accent + (255,))
     text_col = (20, 20, 24) if sum(accent) > 450 else (255, 255, 255)
-    _draw_text(card, (x + 12, 65), label, "bold", 15, text_col)
+    _draw_text(card, (x + 15, 81), label, "bold", 19, text_col)
 
     # Title (up to 2 lines) and artist
-    y = 122
-    for line in _wrap(title, "bold", 34, max_w, 2):
-        _draw_text(card, (x, y), line, "bold", 34, (255, 255, 255))
-        y += 46
+    y = 160
+    for line in _wrap(title, "bold", 48, max_w, 2):
+        _draw_text(card, (x, y), line, "bold", 48, (255, 255, 255))
+        y += 60
     if artist:
-        _draw_text(card, (x, y + 2), _fit(artist, "regular", 22, max_w), "regular", 22, (200, 200, 210))
+        _draw_text(card, (x, y + 2), _fit(artist, "regular", 28, max_w), "regular", 28, (205, 205, 215))
 
     # Progress bar + times + footer
-    bar_y = 232
-    draw.rounded_rectangle((x, bar_y, x + max_w, bar_y + 6), radius=3, fill=(255, 255, 255, 70))
+    bar_y = 308
+    draw.rounded_rectangle((x, bar_y, x + max_w, bar_y + 8), radius=4, fill=(255, 255, 255, 70))
     if duration:
         filled = int(max_w * max(0.0, min(1.0, position / duration)))
         if filled > 0:
-            draw.rounded_rectangle((x, bar_y, x + max(filled, 6), bar_y + 6), radius=3, fill=accent + (255,))
-        draw.ellipse((x + filled - 8, bar_y - 5, x + filled + 8, bar_y + 11), fill=(255, 255, 255))
-    grey = (210, 210, 220)
-    _draw_text(card, (x, bar_y + 30), _fmt(position) if duration else "🔴 LIVE", "regular", 17, grey)
+            draw.rounded_rectangle((x, bar_y, x + max(filled, 8), bar_y + 8), radius=4, fill=accent + (255,))
+        draw.ellipse((x + filled - 11, bar_y - 7, x + filled + 11, bar_y + 15), fill=(255, 255, 255))
+    grey = (215, 215, 225)
+    _draw_text(card, (x, bar_y + 44), _fmt(position) if duration else "🔴 LIVE", "regular", 22, grey)
     if duration:
-        _draw_text(card, (x + max_w, bar_y + 30), _fmt(duration), "regular", 17, grey, anchor="rs")
+        _draw_text(card, (x + max_w, bar_y + 44), _fmt(duration), "regular", 22, grey, anchor="rs")
     if footer:
-        footer = _fit(footer, "regular", 17, max_w * 0.6)
-        _draw_text(card, (x + max_w / 2, bar_y + 30), footer, "regular", 17, (170, 170, 180), anchor="ms")
+        footer = _fit(footer, "regular", 20, max_w * 0.55)
+        _draw_text(card, (x + max_w / 2, bar_y + 44), footer, "regular", 20, (170, 170, 180), anchor="ms")
 
     out = io.BytesIO()
     card.convert("RGB").save(out, "PNG", optimize=True)
