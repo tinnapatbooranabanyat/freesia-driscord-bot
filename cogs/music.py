@@ -36,8 +36,8 @@ IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT") or 180)
 DEFAULT_VOLUME = int(os.getenv("DEFAULT_VOLUME") or 50)
 FFMPEG_BEFORE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin"
 NO_PINGS = discord.AllowedMentions.none()
-PROGRESS_INTERVAL = 15  # seconds between banner image redraws (the text progress bar moves in between)
-TEXT_TICK = 2  # seconds between text progress bar updates
+PROGRESS_INTERVAL = 5  # seconds between banner image redraws (moving progress bar / time)
+MIN_EDIT_GAP = 1.0  # seconds between any two edits of the card (Discord allows ~5 edits / 5s per channel)
 LOOP_LABELS = {"off": "ปิด", "track": "วนเพลงนี้", "queue": "วนทั้งคิว"}
 MAX_SAVED_TRACKS = 500
 MAX_PLAYLISTS_PER_USER = 25
@@ -94,7 +94,7 @@ class GuildPlayer:
         self.synced: SyncedLyrics | None = None  # time-synced lyrics of `synced_for`
         self.synced_for: Track | None = None
         self.np_lyric_index: int | None = None
-        self.np_tick: int | None = None  # TEXT_TICK step the card's text progress bar shows
+        self.np_last_edit = 0.0  # monotonic time of the last card send/edit
         self._wake = asyncio.Event()
         self._done = asyncio.Event()
         self._skip = False
@@ -125,24 +125,8 @@ class GuildPlayer:
         current = text(i) if i >= 0 else "♪ ♪ ♪"
         return f"-# {text(i - 1)}\n### {current}\n-# {text(i + 1)}"
 
-    def progress_line(self) -> str:
-        """`1:23 ━━━━━━●────── 3:19` for the card (updated far more often than the banner image)."""
-        t = self.current
-        position = self.position
-        self.np_tick = int(position) // TEXT_TICK
-        if not t.duration:
-            return "🔴 **LIVE**"
-        frac = max(0.0, min(1.0, position / t.duration))
-        n = 22
-        filled = round(frac * (n - 1))
-        bar = "━" * filled + "●" + "─" * (n - 1 - filled)
-        now = f"{int(min(position, t.duration)) // 60}:{int(min(position, t.duration)) % 60:02}"
-        return f"{'⏸  ' if self.is_paused else ''}**{now}**  {bar}  {fmt_duration(t.duration)}"
-
     def text_is_current(self) -> bool:
-        """True if the card already shows this TEXT_TICK step and lyric line (no edit needed)."""
-        if int(self.position) // TEXT_TICK != self.np_tick:
-            return False
+        """True if the card already shows the current lyric line (no text edit needed)."""
         index = self.current_lyric_index()
         return index is None or index == self.np_lyric_index
 
@@ -160,29 +144,23 @@ class GuildPlayer:
             self.synced, self.synced_for = found, track
 
     async def _lyrics_loop(self) -> None:
-        """Keep the card's text live: a new lyric line as soon as it starts, and the text progress bar every
-        TEXT_TICK seconds. These are text-only edits; the banner image is left untouched."""
-        last_edit = 0.0
+        """Show each new lyric line as soon as it starts (text-only edit; the banner image is left untouched)."""
         while True:
+            lyrics = self.synced if self.synced_for is self.current else None
             vc = self.guild.voice_client
-            if not self.current or not self.np_message or not self.np_image_url or not vc or not vc.is_playing():
+            if not lyrics or not self.np_message or not self.np_image_url or not vc or not vc.is_playing():
                 await asyncio.sleep(1)
                 continue
-            if not self.text_is_current() and time.monotonic() - last_edit >= 1.0:  # >= 1s apart (edit limits)
-                last_edit = time.monotonic()
+            if not self.text_is_current():
                 try:
                     await self.cog.update_now_playing(self, with_image=False)
                 except Exception as e:
-                    log.info("Live text update failed: %r", e)
-            # sleep until the next progress step or the next lyric line, whichever comes first
-            position = self.position
-            wait = (int(position) // TEXT_TICK + 1) * TEXT_TICK - position
-            lyrics = self.synced if self.synced_for is self.current else None
-            if lyrics:
-                i = lyrics.index_at(position + LYRIC_LEAD)
-                if i + 1 < len(lyrics.lines):
-                    wait = min(wait, lyrics.lines[i + 1][0] - LYRIC_LEAD - position)
-            await asyncio.sleep(min(max(wait / FILTERS[self.filter].speed, 0.25), 2.0))
+                    log.info("Lyrics update failed: %r", e)
+            position = self.position + LYRIC_LEAD
+            i = lyrics.index_at(position)
+            nxt = lyrics.lines[i + 1][0] if i + 1 < len(lyrics.lines) else None
+            wait = (nxt - position) / FILTERS[self.filter].speed if nxt is not None else 2
+            await asyncio.sleep(min(max(wait, 0.25), 2.0))
 
     async def _progress_loop(self) -> None:
         """Re-render the banner every PROGRESS_INTERVAL seconds so its progress bar moves too."""
@@ -533,7 +511,6 @@ class NowPlayingCard(discord.ui.LayoutView):
         if has_image:
             media = image_url or f"attachment://{self.IMAGE}"
             container.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem(media)))
-            container.add_item(discord.ui.TextDisplay(player.progress_line()))
         else:
             container.add_item(discord.ui.TextDisplay(f"### 🎶 {t.title}\n⏱️ {fmt_duration(t.duration)}"))
 
@@ -1227,8 +1204,11 @@ class Music(commands.Cog):
             message = player.np_message
             if message is None or not player.current:
                 return
+            gap = MIN_EDIT_GAP - (time.monotonic() - player.np_last_edit)
+            if gap > 0:
+                await asyncio.sleep(gap)  # keep edits >= MIN_EDIT_GAP apart
             if not with_image and player.text_is_current():
-                return  # an image update already drew this while we waited for the lock
+                return  # an image update already drew this while we waited
             view, file = await self._card(player, player.position, with_image)
             try:
                 if file:
@@ -1239,6 +1219,7 @@ class Music(commands.Cog):
                 if player.np_message is message:
                     player.np_message = None
                 return
+            player.np_last_edit = time.monotonic()
             if not file and edited is not None and not getattr(edited, "attachments", None):
                 # Discord dropped the banner on a text-only edit: fall back to full image edits
                 log.warning("Now-playing banner was dropped by a text-only edit; disabling lyrics-only edits")
