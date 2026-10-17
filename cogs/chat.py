@@ -311,12 +311,15 @@ class Chat(commands.Cog):
         if music and not is_dm and not images and _DJ_INTENT.search(request) and not _DJ_NOT.search(request):
             try:
                 async with message.channel.typing():
-                    text = await music.dj_request(message.author, message.channel, request)
+                    result = await music.dj_request(message.author, message.channel, request)
             except LLMError as e:
                 log.error("DJ LLM error: %s", e)
                 await message.reply(LLM_UNAVAILABLE, mention_author=False)
                 return
-            await self._reply(message, (f"> 🎙️ {transcript[:300]}\n" if transcript else "") + text)
+            if isinstance(result, dict):  # banner card with the picked songs
+                await message.reply(mention_author=False, allowed_mentions=NO_PINGS, **result)
+            else:
+                await self._reply(message, (f"> 🎙️ {transcript[:300]}\n" if transcript else "") + result)
             return
 
         where = "ข้อความส่วนตัว (DM)" if is_dm else f"เซิร์ฟเวอร์ {message.guild.name} ห้อง #{message.channel.name}"

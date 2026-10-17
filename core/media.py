@@ -199,10 +199,18 @@ class Track:
 
     @property
     def card_title(self) -> str:
-        """Title without a leading "Artist - " (Spotify tracks), since the card shows the artist separately."""
-        if self.artist and self.title.startswith(f"{self.artist} - "):
-            return self.title[len(self.artist) + 3:]
-        return self.title
+        """Just the song name ("One More Night"), without "Artist - " or "(Official Music Video)" noise:
+        the cards show the artist separately."""
+        from core.lyrics import clean_title  # local import: lyrics doesn't need media
+        song, _ = clean_title(self.title, self.artist)
+        return song or self.title
+
+    @property
+    def display_name(self) -> str:
+        """Clean "Artist - Song" for lists and "next up" lines."""
+        from core.lyrics import clean_title
+        song, artist = clean_title(self.title, self.artist)
+        return f"{artist} - {song}" if artist and song and artist.lower() not in song.lower() else (song or self.title)
 
     async def resolve(self) -> None:
         if self.stream_url and time.time() - self.resolved_at < STREAM_URL_TTL:

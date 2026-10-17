@@ -215,6 +215,11 @@ def _accent(img: Image.Image) -> tuple[int, int, int]:
     return min(255, r + boost), min(255, g + boost), min(255, b + boost)
 
 
+def accent_text(accent: tuple[int, int, int]) -> tuple[int, int, int]:
+    """The accent colour lifted towards white so it reads well as text on the dark card."""
+    return tuple(min(255, int(c + (255 - c) * 0.35)) for c in accent)
+
+
 def _fmt(seconds: float | None) -> str:
     seconds = int(seconds or 0)
     h, rem = divmod(seconds, 3600)
@@ -230,13 +235,26 @@ def render_card(
     position: float = 0.0,
     footer: str | None = None,
     label: str = "NOW PLAYING",
+    bottom: tuple[str, str] | None = None,
 ) -> tuple[bytes, tuple[int, int, int]]:
-    """Return (JPEG bytes, accent RGB colour)."""
+    """Return (JPEG bytes, accent RGB colour). `bottom` = (left, right) text shown instead of the progress bar."""
     with _LOCK:
-        return _render(thumbnail, title, artist, duration, position, footer, label)
+        return _render(thumbnail, title, artist, duration, position, footer, label, bottom)
 
 
-def _render(thumbnail, title, artist, duration, position, footer, label):
+def _placeholder_art() -> Image.Image:
+    """Cover for tracks without a thumbnail (Spotify / AI DJ picks before they are matched on YouTube)."""
+    art = Image.linear_gradient("L").resize((480, 270))
+    art = Image.merge("RGB", (art.point(lambda v: 60 + v // 3), art.point(lambda v: 40 + v // 5), art.point(lambda v: 110 + v // 2)))
+    draw = ImageDraw.Draw(art)
+    # a simple eighth note
+    draw.ellipse((185, 165, 245, 210), fill=(255, 255, 255))
+    draw.rectangle((233, 60, 245, 188), fill=(255, 255, 255))
+    draw.polygon([(245, 60), (300, 85), (300, 110), (245, 88)], fill=(255, 255, 255))
+    return art
+
+
+def _render(thumbnail, title, artist, duration, position, footer, label, bottom=None):
     thumb = None
     if thumbnail:
         try:
@@ -244,7 +262,7 @@ def _render(thumbnail, title, artist, duration, position, footer, label):
         except Exception as e:
             log.warning("Bad thumbnail: %r", e)
     if thumb is None:
-        thumb = Image.new("RGB", (480, 270), (40, 44, 52))
+        thumb = _placeholder_art()
     accent = _accent(thumb)
 
     # Background: blurred, darkened thumbnail + left-to-right shade
@@ -281,6 +299,16 @@ def _render(thumbnail, title, artist, duration, position, footer, label):
         y += 60
     if artist:
         _draw_text(card, (x, y + 2), _fit(artist, "regular", 28, max_w), "regular", 28, (205, 205, 215))
+
+    if bottom:  # info line instead of a progress bar (queue cards)
+        left, right = bottom
+        draw.rounded_rectangle((x, 300, x + max_w, 302), radius=1, fill=(95, 95, 105))
+        _draw_text(card, (x, 344), _fit(left, "bold", 24, max_w * 0.62), "bold", 24, accent_text(accent))
+        if right:
+            _draw_text(card, (x + max_w, 344), _fit(right, "regular", 22, max_w * 0.36), "regular", 22, (215, 215, 225), anchor="rs")
+        out = io.BytesIO()
+        card.convert("RGB").save(out, "JPEG", quality=90, optimize=True)
+        return out.getvalue(), accent
 
     # Progress bar + times + footer
     bar_y = 308

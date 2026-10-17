@@ -322,7 +322,7 @@ class GuildPlayer:
         tracks = [Track.from_info(i, self.guild.me, resolved=False) for i in infos]
         if tracks:
             self.queue.extend(tracks)
-            await self._send(f"🔄 **Autoplay:** เพิ่ม {len(tracks)} เพลงที่คล้ายกับ **{seed.title[:80]}**")
+            await self._send(**await self.cog.queued_message(self, tracks, "Autoplay", "autoplay", name=seed.card_title[:60]))
 
     def _after(self, error: Exception | None) -> None:
         if error:
@@ -512,7 +512,7 @@ class NowPlayingCard(discord.ui.LayoutView):
         # Plain text with bold labels (no emoji) so the details read cleanly under the banner
         info = [f"**ขอโดย** {t.requester.display_name}"]
         if player.queue:
-            nxt = player.queue[0].title
+            nxt = player.queue[0].display_name
             info.append(f"**ถัดไป** {nxt[:50] + ('…' if len(nxt) > 50 else '')}")
             info.append(f"**คิว** {len(player.queue)} เพลง ({fmt_duration(sum(x.duration or 0 for x in player.queue))})")
         elif player.autoplay:
@@ -658,6 +658,20 @@ class NowPlayingCard(discord.ui.LayoutView):
         await interaction.response.send_message(
             f"⭐ เพิ่ม **{track.title}** ลง {FAVORITES} แล้ว ({len(saved) + 1} เพลง)\n"
             f"-# เปิดทั้งหมดได้ด้วย `/playlist load name:{FAVORITES}`", ephemeral=True)
+
+
+class QueuedCard(discord.ui.LayoutView):
+    """Banner card posted when songs are added (single song, playlist, AI DJ picks, autoplay)."""
+
+    IMAGE = "queued.jpg"
+
+    def __init__(self, accent: tuple[int, int, int] | None, text: str, has_image: bool):
+        super().__init__(timeout=None)
+        container = discord.ui.Container(accent_colour=discord.Colour.from_rgb(*accent) if accent else discord.Colour.blurple())
+        if has_image:
+            container.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem(f"attachment://{self.IMAGE}")))
+        container.add_item(discord.ui.TextDisplay(text))
+        self.add_item(container)
 
 
 class QueueView(discord.ui.View):
@@ -825,8 +839,8 @@ class TrackSelectView(discord.ui.View):
         self.select.disabled = True
         self.select.placeholder = f"✅ {track.title}"[:150]
         await interaction.edit_original_response(view=self)
-        text = f"🎵 กำลังเปิด **{track.link}**" if was_idle else f"➕ เพิ่ม **{track.link}** ลงคิว (ลำดับที่ {len(player.queue)})"
-        await interaction.followup.send(text, allowed_mentions=NO_PINGS)
+        if not was_idle:  # (if it plays right away, the now-playing card shows it)
+            await interaction.followup.send(**await self.cog.queued_message(player, [track], interaction.user.display_name))
         self.stop()
 
     async def on_timeout(self) -> None:
@@ -1040,8 +1054,9 @@ class Music(commands.Cog):
         return None
 
     async def dj_request(self, member: discord.Member, text_channel: discord.abc.Messageable,
-                         prompt: str, count: int = 8) -> str:
-        """AI picks songs for a free-text request and queues them. Returns the reply text (raises LLMError)."""
+                         prompt: str, count: int = 8) -> str | dict:
+        """AI picks songs for a free-text request and queues them.
+        Returns send kwargs for the banner card, or an error text (raises LLMError)."""
         chat = self.bot.get_cog("Chat")
         if chat is None:
             return "ระบบ AI ยังไม่พร้อม"
@@ -1062,9 +1077,10 @@ class Music(commands.Cog):
         player, error = await self.connect(member, text_channel)
         if error:
             return error
-        player.add([Track.from_search(s, member) for s in songs])
-        lines = "\n".join(f"`{i}.` {s}" for i, s in enumerate(songs, 1))
-        return f"🎧 {data.get('reply') or 'จัดให้!'}\n{lines}"
+        tracks = [Track.from_search(s, member) for s in songs]
+        player.add(tracks)
+        return await self.queued_message(player, tracks, member.display_name, "dj", name=prompt[:80],
+                                         intro=f"**{data.get('reply') or 'จัดให้!'}**")
 
     # ---------- save / restore queues across restarts ----------
 
@@ -1199,6 +1215,58 @@ class Music(commands.Cog):
                 player.np_image_url = None
             self._sent(player, edited, view)
 
+    async def queued_message(self, player: GuildPlayer, tracks: list[Track], requester: str, kind: str = "single",
+                             name: str | None = None, intro: str | None = None) -> dict:
+        """Kwargs for send/followup: a banner card for songs just added. kind: single | playlist | dj | autoplay."""
+        first = tracks[0]
+        total = sum(t.duration or 0 for t in tracks)
+
+        def line(t: Track) -> str:
+            title = t.display_name.replace("[", "(").replace("]", ")")[:70]
+            return f"[{title}](<{t.url}>)" if t.url else title
+
+        def listing(limit: int = 5) -> str:
+            rows = [f"`{i}.` {line(t)}" for i, t in enumerate(tracks[:limit], 1)]
+            more = f"\n-# และอีก {len(tracks) - limit} เพลง" if len(tracks) > limit else ""
+            return "\n".join(rows) + more
+
+        if kind == "single":
+            position = len(player.queue)
+            ahead = player.queue[:-1] if player.queue and player.queue[-1] is first else player.queue
+            wait = sum(t.duration or 0 for t in ahead)
+            if player.current and player.current.duration:
+                wait += max(0.0, player.current.duration - player.position)
+            label, title, artist = "ADDED TO QUEUE", first.card_title, first.artist or ""
+            bottom = (f"ลำดับที่ {position} ในคิว", f"เล่นในอีก ~{fmt_duration(wait)}" if wait else "")
+            info = [f"**ขอโดย** {requester}", f"**ลำดับ** {position}"]
+            if first.duration:
+                info.append(f"**ความยาว** {fmt_duration(first.duration)}")
+            text = f"**{line(first)}**\n-# " + "   ·   ".join(info)
+        elif kind == "playlist":
+            label, title, artist = "PLAYLIST ADDED", name or "Playlist", f"ขอโดย {requester}"
+            bottom = (f"{len(tracks)} เพลง", f"รวม {fmt_duration(total)}" if total else "")
+            info = [f"**ขอโดย** {requester}", f"**จำนวน** {len(tracks)} เพลง"]
+            if total:
+                info.append(f"**รวม** {fmt_duration(total)}")
+            text = f"**เพิ่มเพลย์ลิสต์ {name or ''}**\n-# " + "   ·   ".join(info) + "\n" + listing()
+        elif kind == "dj":
+            label, title, artist = "AI DJ", name or "AI DJ", f"เลือกโดย AI DJ ให้ {requester}"
+            bottom = (f"{len(tracks)} เพลง", "")
+            text = (f"{intro}\n" if intro else "") + listing(len(tracks))
+        else:  # autoplay
+            label, title, artist = "AUTOPLAY", name or "เพลงแนวเดียวกัน", "เพลงที่คล้ายกัน"
+            bottom = (f"{len(tracks)} เพลง", f"รวม {fmt_duration(total)}" if total else "")
+            text = f"**Autoplay** เพิ่มเพลงแนวเดียวกับ **{name or ''}**\n" + listing()
+
+        data = await self._fetch_image(first.thumbnail)
+        try:
+            jpg, accent = await asyncio.get_running_loop().run_in_executor(
+                None, render_card, data, title, artist, None, 0.0, None, label, bottom)
+        except Exception:
+            log.exception("Could not render queue card")
+            return {"view": QueuedCard(None, text, has_image=False)}
+        return {"view": QueuedCard(accent, text, has_image=True), "file": discord.File(io.BytesIO(jpg), filename=QueuedCard.IMAGE)}
+
     async def now_playing_message(self, player: GuildPlayer, position: float = 0.0) -> dict:
         """Kwargs for channel.send: the Components V2 card (+ its banner image)."""
         view, file = await self._card(player, position)
@@ -1276,12 +1344,12 @@ class Music(commands.Cog):
 
         was_idle = player.current is None and not player.queue
         player.add(tracks)
-        if playlist:
-            await interaction.followup.send(f"📃 เพิ่ม **{len(tracks)}** เพลงจาก **{playlist}** ลงคิวแล้ว")
-        elif was_idle:
-            await interaction.followup.send(f"🎵 กำลังเปิด **{tracks[0].link}**")
-        else:
-            await interaction.followup.send(f"➕ เพิ่ม **{tracks[0].link}** ลงคิว (ลำดับที่ {len(player.queue)})")
+        if was_idle and not playlist:
+            # it starts right away: the now-playing card is the confirmation, no second banner for the same song
+            await interaction.delete_original_response()
+            return
+        await interaction.followup.send(**await self.queued_message(
+            player, tracks, interaction.user.display_name, "playlist" if playlist else "single", name=playlist))
 
     @app_commands.command(name="pause", description="หยุดเพลงชั่วคราว")
     async def pause(self, interaction: discord.Interaction) -> None:
@@ -1583,11 +1651,14 @@ class Music(commands.Cog):
             return
         await interaction.response.defer(thinking=True)
         try:
-            text = await self.dj_request(interaction.user, interaction.channel, request, count)
+            result = await self.dj_request(interaction.user, interaction.channel, request, count)
         except LLMError as e:
             log.error("DJ LLM error: %s", e)
-            text = "ขอโทษครับ ตอนนี้ AI เลือกเพลงไม่ได้ (อาจโดน rate limit) ลองใหม่อีกครั้งนะ 🙏"
-        await interaction.followup.send(f"> **{interaction.user.display_name}:** {request[:200]}\n{text}", allowed_mentions=NO_PINGS)
+            result = "ขอโทษครับ ตอนนี้ AI เลือกเพลงไม่ได้ (อาจโดน rate limit) ลองใหม่อีกครั้งนะ 🙏"
+        if isinstance(result, dict):
+            await interaction.followup.send(**result)
+        else:
+            await interaction.followup.send(result, allowed_mentions=NO_PINGS)
 
     @app_commands.command(name="say", description="ให้บอทพูดข้อความในห้องเสียง")
     @app_commands.describe(text="ข้อความที่จะให้พูด", voice="เสียงผู้หญิงหรือผู้ชาย")
@@ -1655,7 +1726,8 @@ class Music(commands.Cog):
         if shuffle:
             random.shuffle(tracks)
         player.add(tracks)
-        await interaction.followup.send(f"📂 เพิ่ม **{len(tracks)}** เพลงจากเพลย์ลิสต์ **{name}** ลงคิวแล้ว{' (สุ่มลำดับ)' if shuffle else ''}")
+        await interaction.followup.send(**await self.queued_message(
+            player, tracks, interaction.user.display_name, "playlist", name=name + (" (สุ่มลำดับ)" if shuffle else "")))
 
     @playlist.command(name="list", description="ดูเพลย์ลิสต์ที่คุณบันทึกไว้")
     async def playlist_list(self, interaction: discord.Interaction) -> None:
