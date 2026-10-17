@@ -508,22 +508,21 @@ class NowPlayingCard(discord.ui.LayoutView):
             container.add_item(discord.ui.TextDisplay(f"### 🎶 {t.title}\n⏱️ {fmt_duration(t.duration)}"))
 
         title = t.title.replace("[", "(").replace("]", ")")
-        link = f"[{title[:80]}](<{t.url}>)" if t.url else title[:80]
-        details = [f"🔗 {link}", f"-# 🎧 ขอโดย **{t.requester.display_name}**"]
-        extras = []
+        link = f"**[{title[:80]}](<{t.url}>)**" if t.url else f"**{title[:80]}**"
+        # Plain text with bold labels (no emoji) so the details read cleanly under the banner
+        info = [f"**ขอโดย** {t.requester.display_name}"]
         if player.queue:
             nxt = player.queue[0].title
-            extras.append(f"⏭️ ถัดไป: {nxt[:50] + ('…' if len(nxt) > 50 else '')}")
-            extras.append(f"📜 {len(player.queue)} เพลง · {fmt_duration(sum(x.duration or 0 for x in player.queue))}")
+            info.append(f"**ถัดไป** {nxt[:50] + ('…' if len(nxt) > 50 else '')}")
+            info.append(f"**คิว** {len(player.queue)} เพลง ({fmt_duration(sum(x.duration or 0 for x in player.queue))})")
         elif player.autoplay:
-            extras.append("⏭️ ถัดไป: ♾️ Autoplay")
+            info.append("**ถัดไป** Autoplay")
         if player.loop_mode != "off":
-            extras.append(f"🔁 {LOOP_LABELS[player.loop_mode]}")
+            info.append(f"**วนซ้ำ** {LOOP_LABELS[player.loop_mode]}")
         if player.filter != "off":
-            extras.append(f"🎛️ {FILTERS[player.filter].label}")
-        extras.append(f"🔊 {round(player.volume * 100)}%")
-        details[-1] += "  •  " + "  •  ".join(extras)
-        container.add_item(discord.ui.TextDisplay("\n".join(details)))
+            info.append(f"**เอฟเฟกต์** {FILTERS[player.filter].label.split(' ', 1)[-1]}")  # label without its emoji
+        info.append(f"**เสียง** {round(player.volume * 100)}%")
+        container.add_item(discord.ui.TextDisplay(f"{link}\n-# " + "   ·   ".join(info)))
         container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
 
         grey, green, red = discord.ButtonStyle.secondary, discord.ButtonStyle.success, discord.ButtonStyle.danger
