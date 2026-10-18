@@ -90,6 +90,8 @@ class Song:
         for v in self.variants:
             if g == v or (len(v) >= 3 and v in g):  # exact (even 1-syllable answers like 춤) or contained
                 return True
+            if len(g) >= 3 and g in v and len(g) >= 0.6 * len(v):  # most of a long name
+                return True
             if len(g) >= 3 and SequenceMatcher(None, g, v).ratio() >= 0.8:
                 return True
         return False

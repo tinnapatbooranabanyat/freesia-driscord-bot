@@ -24,7 +24,8 @@ class Lyrics:
 # "(Official MV)", "[Lyric Video]", "「Official MV」", "| 4K", "ft. X" ... are noise for a lyrics search / quiz answer
 _NOISE = re.compile(
     r"[\(\[【「『][^\)\]】」』]*(official|m/?v|music video|video|audio|lyric|visuali[sz]er|4k|hd|hq|remaster|"
-    r"live|performance|teaser|color coded|eng|sub|ver\.?|เพลงจาก|ประกอบ|ost)[^\)\]】」』]*[\)\]】」』]",
+    r"live|performance|teaser|color coded|eng|sub|ver\.?|เพลงจาก|ประกอบ|ost|เนื้อเพลง|คาราโอเกะ|ซับไทย|แปลไทย|"
+    r"ละคร|ซีรีส์|ภาพยนตร์|หนัง)[^\)\]】」』]*[\)\]】」』]",
     re.I,
 )
 _FEAT = re.compile(r"\s+(?:ft\.|feat\.|ft\s|feat\s|featuring\s|x\s).*$", re.I)
@@ -35,6 +36,8 @@ _SUFFIX = re.compile(
 _JP_TITLE = re.compile(r"[「『](.+?)[」』]")  # YOASOBI「夜に駆ける」 -> song inside the brackets
 _QUOTED = re.compile(r"['‘’\"“”](.+?)(?:['‘’\"“”]|$)")  # aespa 'LEMONADE' MV -> song in quotes
 _QUOTES = " '\"‘’“”-–—"
+# "จมน้ำตา OST.มณีพยาบาท", "Song (Prod. X)", "เพลงประกอบละคร ..." trailing the song name
+_SOUNDTRACK = re.compile(r"\s*(?:\bO\.?S\.?T\b\.?|เพลงประกอบ|ประกอบละคร|ประกอบซีรีส์|\bprod\.).*$", re.I)
 _THAI = re.compile(r"[฀-๿]")
 
 
@@ -60,7 +63,7 @@ def clean_title(title: str, artist: str | None) -> tuple[str, str | None]:
         artist = t[:quoted.start()].strip(_QUOTES)
         t = quoted.group(1)
     t = _FEAT.sub("", t).strip(_QUOTES)
-    for sep in (" - ", " – ", " / "):
+    for sep in (" - ", " – ", " / ", " : "):
         if sep in t:
             left, right = (s.strip(_QUOTES) for s in t.split(sep, 1))
             if _same(artist, left):
@@ -72,6 +75,9 @@ def clean_title(title: str, artist: str | None) -> tuple[str, str | None]:
             else:  # international convention "Artist - Song"
                 artist, t = left, right
             break
+    t = _SOUNDTRACK.sub("", t).strip(_QUOTES) or t
+    if artist:
+        artist = _SOUNDTRACK.sub("", artist).strip(_QUOTES) or artist
     previous = None
     while previous != t:  # peel off trailing "M/V", "Official Video", "Lyrics", quotes...
         previous = t
