@@ -9,7 +9,6 @@ import re
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
-from difflib import SequenceMatcher
 
 import discord
 from discord import app_commands
@@ -52,6 +51,19 @@ _BAD = re.compile(
 _HAS_SEPARATOR = re.compile(r" [-–/] |['‘’\"“”「『]")  # we need to be able to tell the song name apart
 
 
+def edit_distance(a: str, b: str) -> int:
+    """Levenshtein distance (number of single-character edits)."""
+    if abs(len(a) - len(b)) > 2:
+        return 3  # more than any typo we accept
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
 def normalize(text: str) -> str:
     text = unicodedata.normalize("NFKC", text).lower()
     return "".join(ch for ch in text if ch.isalnum() or unicodedata.category(ch).startswith("M"))
@@ -84,15 +96,16 @@ class Song:
                    [v for v in variants if v])
 
     def check(self, guess: str) -> bool:
+        """The full song name is required: exact (ignoring case/spaces/punctuation), the full name plus extra
+        words ("choom babymonster"), or a small typo (1 character, 2 for names longer than 8)."""
         g = normalize(guess)
         if not g:
             return False
         for v in self.variants:
-            if g == v or (len(v) >= 3 and v in g):  # exact (even 1-syllable answers like 춤) or contained
+            if g == v or (len(v) >= 3 and v in g):
                 return True
-            if len(g) >= 3 and g in v and len(g) >= 0.6 * len(v):  # most of a long name
-                return True
-            if len(g) >= 3 and SequenceMatcher(None, g, v).ratio() >= 0.8:
+            # typos only: same length +-1 (so dropping a whole word like "up" doesn't count)
+            if len(v) >= 3 and abs(len(g) - len(v)) <= 1 and edit_distance(g, v) <= (1 if len(v) <= 8 else 2):
                 return True
         return False
 
