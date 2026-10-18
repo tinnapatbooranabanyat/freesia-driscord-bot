@@ -13,6 +13,7 @@ import random
 import re
 import time
 from collections import deque
+from datetime import datetime, timedelta
 from dataclasses import dataclass
 
 import aiohttp
@@ -21,12 +22,13 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from core import media
-from core.card import circle_png, render_card
+from core.card import circle_png, render_card, render_notice
 from core.icons import ICON_NAMES, emoji_name, render_icon
 from core.llm import LLMError
 from core.lyrics import SyncedLyrics, find_lyrics, find_synced
-from core.media import Track, fmt_duration
+from core.media import Track, fmt_duration, parse_time
 from core.spotify import SpotifyError
+from core.timeparse import THAI_TZ, parse_when
 from core.tts import TTSError, synthesize
 
 log = logging.getLogger(__name__)
@@ -37,6 +39,8 @@ DEFAULT_VOLUME = int(os.getenv("DEFAULT_VOLUME") or 50)
 FFMPEG_BEFORE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin"
 NO_PINGS = discord.AllowedMentions.none()
 PROGRESS_INTERVAL = 5  # seconds between banner image redraws (moving progress bar / time)
+LOUDNORM = "loudnorm=I=-14:TP=-1.5:LRA=11"  # EBU R128: every song plays at about the same loudness
+SLEEP_FADE = 10  # seconds of fade-out before the sleep timer stops the music
 MIN_EDIT_GAP = 1.0  # seconds between any two edits of the card (Discord allows ~5 edits / 5s per channel)
 LOOP_LABELS = {"off": "ปิด", "track": "วนเพลงนี้", "queue": "วนทั้งคิว"}
 MAX_SAVED_TRACKS = 500
@@ -95,6 +99,10 @@ class GuildPlayer:
         self.synced_for: Track | None = None
         self.np_lyric_index: int | None = None
         self.np_last_edit = 0.0  # monotonic time of the last card send/edit
+        self.normalize = True  # loudness normalisation (per-server setting)
+        self.sleep_until: float | None = None  # wall-clock time the sleep timer stops the music
+        self.sleep_after_track = False  # stop when the current song ends
+        self.sleep_task: asyncio.Task | None = None
         self._wake = asyncio.Event()
         self._done = asyncio.Event()
         self._skip = False
@@ -279,7 +287,35 @@ class GuildPlayer:
             "loop": self.loop_mode,
             "filter": self.filter,
             "np_message": self.np_message.id if self.np_message else None,
+            "sleep_until": self.sleep_until,
+            "sleep_after_track": self.sleep_after_track,
         }
+
+    async def _notice(self, kind: str, icon: str, title: str, subtitle: str | None = None,
+                      detail: str | None = None) -> None:
+        await self._send(**await self.cog.notice(kind, icon, title, subtitle, detail))
+
+    def set_sleep(self, seconds: float | None, after_track: bool = False) -> None:
+        """Sleep timer: stop after `seconds` (fading out), or when the current song ends. None/False cancels."""
+        if self.sleep_task:
+            self.sleep_task.cancel()
+            self.sleep_task = None
+        self.sleep_after_track = after_track
+        self.sleep_until = time.time() + seconds if seconds else None
+        if seconds:
+            self.sleep_task = asyncio.create_task(self._sleep_timer())
+
+    async def _sleep_timer(self) -> None:
+        await asyncio.sleep(max(0.0, self.sleep_until - time.time() - SLEEP_FADE))
+        start = self.volume
+        for step in range(1, SLEEP_FADE + 1):  # gentle fade-out
+            vc = self.guild.voice_client
+            if vc and isinstance(vc.source, discord.PCMVolumeTransformer):
+                vc.source.volume = start * (1 - step / SLEEP_FADE)
+            await asyncio.sleep(1)
+        self.sleep_task = None
+        await self._notice("sleep", "moon", "หมดเวลาตั้งปิดเพลงแล้ว", "หลับฝันดีนะ ขอออกจากห้องเสียงก่อน")
+        await self.cog.destroy(self.guild)
 
     async def _send(self, content: str | None = None, **kwargs) -> None:
         try:
@@ -338,8 +374,8 @@ class GuildPlayer:
 
     def _source(self, track: Track, offset: float) -> discord.AudioSource:
         before = FFMPEG_BEFORE + (f" -ss {offset:.2f}" if offset > 0 else "")
-        af = FILTERS[self.filter].af
-        options = "-vn" + (f' -af "{af}"' if af else "")
+        chain = [f for f in (FILTERS[self.filter].af, LOUDNORM if self.normalize else None) if f]
+        options = "-vn" + (f' -af "{",".join(chain)}"' if chain else "")
         audio = discord.FFmpegPCMAudio(track.stream_url, executable=FFMPEG_PATH, before_options=before, options=options)
         return discord.PCMVolumeTransformer(audio, volume=self.volume)
 
@@ -364,7 +400,7 @@ class GuildPlayer:
         if time.monotonic() - self._last_reconnect < 120:
             return False  # dropped again right after reconnecting: probably kicked on purpose
         self._last_reconnect = time.monotonic()
-        await self._send("🔌 หลุดจากห้องเสียง กำลังเชื่อมต่อใหม่…")
+        await self._notice("warn", "loop", "หลุดจากห้องเสียง", "กำลังเชื่อมต่อใหม่…")
         for attempt in range(3):
             await asyncio.sleep(3 + attempt * 5)
             if self.leaving:
@@ -394,7 +430,7 @@ class GuildPlayer:
                 if track is _INTERRUPT:
                     continue
                 if track is None:
-                    await self._send("💤 ไม่มีเพลงในคิวแล้ว ขอออกจากห้องเสียงก่อนนะ")
+                    await self._notice("sleep", "moon", "ไม่มีเพลงในคิวแล้ว", "ขอออกจากห้องเสียงก่อนนะ")
                     return
                 vc = self.guild.voice_client
                 if vc is None or not vc.is_connected():
@@ -412,17 +448,17 @@ class GuildPlayer:
                     if failures >= 3:
                         # Several songs in a row failed: YouTube is probably blocking us, don't burn through the queue
                         self.queue.clear()
-                        await self._send(
-                            "⚠️ เปิดเพลงไม่ได้ติดกัน 3 เพลง"
-                            + (" (YouTube ขอให้ยืนยันว่าไม่ใช่บอท)" if blocked else "")
-                            + " จึงล้างคิวไว้ก่อน — ลองใหม่ภายหลัง หรือให้แอดมินตั้งค่า YTDL_COOKIES (ดู README)"
+                        await self._notice(
+                            "error", "alert", "เปิดเพลงไม่ได้ติดกัน 3 เพลง",
+                            "ล้างคิวไว้ก่อน ลองใหม่ภายหลัง" + (" (YouTube ขอให้ยืนยันว่าไม่ใช่บอท)" if blocked else ""),
+                            detail="ถ้าเป็นบ่อย ให้แอดมินตั้งค่า YTDL_COOKIES (ดู README)",
                         )
                         await self.cog.notify("youtube-block", f"⚠️ เปิดเพลงไม่ได้ติดกันในเซิร์ฟเวอร์ **{self.guild.name}**\n`{err[:300]}`")
                         failures = 0
                     elif blocked:
-                        await self._send(f"⚠️ YouTube ไม่ให้เปิด **{track.title}** (ขอให้ยืนยันว่าไม่ใช่บอท) ข้ามไปเพลงถัดไป")
+                        await self._notice("warn", "alert", "YouTube ไม่ให้เปิดเพลงนี้", f"ข้าม {track.display_name}")
                     else:
-                        await self._send(f"⚠️ เล่น **{track.title}** ไม่ได้ ข้ามไปเพลงถัดไป\n`{err[:200]}`")
+                        await self._notice("warn", "alert", "เล่นเพลงนี้ไม่ได้", f"ข้าม {track.display_name}", detail=err[:200])
                     continue
 
                 self.current = track
@@ -455,13 +491,17 @@ class GuildPlayer:
                     self._restart_at = offset
                     continue
 
+                if self.sleep_after_track and self._restart_at is None and not self._voice_lost():
+                    await self._notice("sleep", "moon", "จบเพลงนี้แล้ว ถึงเวลาพัก", "หลับฝันดีนะ ขอออกจากห้องเสียงก่อน")
+                    return
+
                 if self._voice_lost() and self.current:
                     position = self.position
                     if await self._reconnect():
                         self._restart_at = position
-                        await self._send(f"✅ กลับมาแล้ว เล่นต่อจาก {fmt_duration(position)}")
+                        await self._notice("ok", "check", "กลับมาแล้ว", f"เล่นต่อจาก {fmt_duration(position)}")
                     else:
-                        await self._send("❌ เชื่อมต่อห้องเสียงใหม่ไม่ได้ ใช้ /play เพื่อเริ่มใหม่ได้เลย")
+                        await self._notice("error", "x", "เชื่อมต่อห้องเสียงใหม่ไม่ได้", "ใช้ /play เพื่อเริ่มใหม่ได้เลย")
                         return
         except asyncio.CancelledError:
             raise
@@ -529,6 +569,11 @@ class NowPlayingCard(discord.ui.LayoutView):
         if player.filter != "off":
             info.append(f"**เอฟเฟกต์** {FILTERS[player.filter].label.split(' ', 1)[-1]}")  # label without its emoji
         info.append(f"**เสียง** {round(player.volume * 100)}%")
+        if player.sleep_until:
+            left = max(0, int(player.sleep_until - time.time()))
+            info.append(f"**ปิดเพลงใน** {left // 60}:{left % 60:02}")
+        elif player.sleep_after_track:
+            info.append("**ปิดเพลง** หลังเพลงนี้")
         container.add_item(discord.ui.TextDisplay(f"{link}\n-# " + "   ·   ".join(info)))
         container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
 
@@ -611,8 +656,8 @@ class NowPlayingCard(discord.ui.LayoutView):
         player = await self._controllable(interaction)
         if not player or not await self.cog.require_dj(interaction):
             return
-        await interaction.response.send_message(f"⏹️ **{interaction.user.display_name}** หยุดเพลงและให้บอทออกจากห้องแล้ว",
-                                                allowed_mentions=NO_PINGS)
+        await interaction.response.send_message(**await self.cog.notice(
+            "info", "stop", "หยุดเพลงแล้ว", f"โดย {interaction.user.display_name} • บอทออกจากห้องเสียงแล้ว"))
         await self.cog.destroy(interaction.guild)
 
     async def on_loop(self, interaction: discord.Interaction) -> None:
@@ -665,6 +710,20 @@ class NowPlayingCard(discord.ui.LayoutView):
         await interaction.response.send_message(
             f"⭐ เพิ่ม **{track.title}** ลง {FAVORITES} แล้ว ({len(saved) + 1} เพลง)\n"
             f"-# เปิดทั้งหมดได้ด้วย `/playlist load name:{FAVORITES}`", ephemeral=True)
+
+
+class NoticeCard(discord.ui.LayoutView):
+    """A short status message drawn as a banner (icon badge + title + subtitle), with optional small text."""
+
+    IMAGE = "notice.jpg"
+
+    def __init__(self, colour: tuple[int, int, int], alt: str, detail: str | None = None):
+        super().__init__(timeout=None)
+        container = discord.ui.Container(accent_colour=discord.Colour.from_rgb(*colour))
+        container.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem(f"attachment://{self.IMAGE}", description=alt[:1000])))
+        if detail:
+            container.add_item(discord.ui.TextDisplay(f"-# {detail}"))
+        self.add_item(container)
 
 
 class QueuedCard(discord.ui.LayoutView):
@@ -914,6 +973,8 @@ class Music(commands.Cog):
                 player.task.cancel()
             player.progress_task.cancel()
             player.lyrics_task.cancel()
+            if player.sleep_task and player.sleep_task is not asyncio.current_task():
+                player.sleep_task.cancel()
             if player.np_view:
                 player.np_view.stop()
             await self.delete_message(player.np_message)  # the card's buttons would be dead anyway
@@ -984,7 +1045,8 @@ class Music(commands.Cog):
         text, skipped = self.skip_action(interaction.user, player)
         if skipped:
             player.next_status = text
-        await interaction.response.send_message(text, allowed_mentions=NO_PINGS)
+        await interaction.response.send_message(**await self.notice(
+            "music" if skipped else "info", "next", "ข้ามเพลงแล้ว" if skipped else "โหวตข้ามเพลง", text.split(" ", 1)[-1]))
 
     async def set_autoplay(self, interaction: discord.Interaction, enabled: bool | None) -> None:
         player = self.players.get(interaction.guild_id)
@@ -995,12 +1057,14 @@ class Music(commands.Cog):
             player.autoplay = enabled
             if enabled and not player.queue and not player.current and player.last_track:
                 player._wake.set()  # idle right now: let the loop pick related songs immediately
-        text = "🔄 เปิด Autoplay แล้ว — พอคิวหมดจะหาเพลงแนวเดียวกันมาเล่นต่อ" if enabled else "🔄 ปิด Autoplay แล้ว"
-        await interaction.response.send_message(text)
+        await interaction.response.send_message(**await self.notice(
+            "music", "autoplay", "เปิด Autoplay แล้ว" if enabled else "ปิด Autoplay แล้ว",
+            "พอคิวหมดจะหาเพลงแนวเดียวกันมาเล่นต่อ" if enabled else None))
 
     async def _new_player(self, guild: discord.Guild, text_channel: discord.abc.Messageable) -> GuildPlayer:
         player = self.players[guild.id] = GuildPlayer(self, guild, text_channel)
         player.autoplay = (await self.storage.get_setting(guild.id, "autoplay")) == "1"
+        player.normalize = (await self.storage.get_setting(guild.id, "normalize")) != "0"
         volume = await self.storage.get_setting(guild.id, "volume")
         if volume:
             player.volume = int(volume) / 100
@@ -1034,7 +1098,7 @@ class Music(commands.Cog):
         """connect() for slash commands (after defer): reports problems as a followup."""
         player, error = await self.connect(interaction.user, interaction.channel)
         if error:
-            await interaction.followup.send(error)
+            await interaction.followup.send(**await self.notice("warn", "alert", "ยังเปิดเพลงไม่ได้", re.sub(r"^\W+", "", error)))
         return player
 
     @staticmethod
@@ -1138,9 +1202,26 @@ class Music(commands.Cog):
         player._resume_offset = position or None
         player.add(tracks)
         log.info("Restored %d tracks in guild %s", len(tracks), guild_id)
-        await player._send(f"♻️ บอทเพิ่งรีสตาร์ต — กลับมาเล่นต่อจาก **{tracks[0].title[:80]}**"
-                           + (f" ที่ {fmt_duration(position)}" if position else "")
-                           + (f" (+ คิวอีก {len(tracks) - 1} เพลง)" if len(tracks) > 1 else ""))
+        sleep_until = state.get("sleep_until")
+        if sleep_until and sleep_until > time.time():
+            player.set_sleep(sleep_until - time.time())
+        elif state.get("sleep_after_track"):
+            player.set_sleep(None, after_track=True)
+        await player._notice("ok", "loop", "กลับมาเล่นต่อหลังรีสตาร์ต",
+                             tracks[0].display_name + (f" ที่ {fmt_duration(position)}" if position else "")
+                             + (f" • คิวอีก {len(tracks) - 1} เพลง" if len(tracks) > 1 else ""))
+
+    async def notice(self, kind: str, icon: str, title: str, subtitle: str | None = None,
+                     detail: str | None = None) -> dict:
+        """Send kwargs for a status banner. kind: error | warn | ok | music | info | sleep."""
+        try:
+            jpg, colour = await asyncio.get_running_loop().run_in_executor(None, render_notice, icon, title, subtitle, kind)
+        except Exception:
+            log.exception("Could not render notice")
+            text = f"**{title}**" + (f"\n{subtitle}" if subtitle else "") + (f"\n-# {detail}" if detail else "")
+            return {"content": text}
+        alt = title + (f" — {subtitle}" if subtitle else "")
+        return {"view": NoticeCard(colour, alt, detail), "file": discord.File(io.BytesIO(jpg), filename=NoticeCard.IMAGE)}
 
     async def _fetch_image(self, url: str | None) -> bytes | None:
         if not url:
@@ -1346,11 +1427,12 @@ class Music(commands.Cog):
         try:
             playlist, tracks = await media.load(query, interaction.user)
         except SpotifyError as e:
-            await interaction.followup.send(f"❌ {e}")
+            await interaction.followup.send(**await self.notice("error", "x", "เปิดลิงก์ Spotify ไม่ได้", str(e)))
             return
         except Exception as e:
             log.warning("Load failed for %r: %r", query, e)
-            await interaction.followup.send(f"❌ หาเพลงไม่เจอหรือเปิดลิงก์ไม่ได้\n`{str(e)[:300]}`")
+            await interaction.followup.send(**await self.notice("error", "x", "หาเพลงไม่เจอหรือเปิดลิงก์ไม่ได้",
+                                                                 "ลองพิมพ์ชื่อเพลงใหม่ หรือใช้ลิงก์ YouTube", detail=str(e)[:200]))
             return
 
         was_idle = player.current is None and not player.queue
@@ -1368,7 +1450,7 @@ class Music(commands.Cog):
         if not player:
             return
         if player.pause():
-            await interaction.response.send_message("⏸️ หยุดชั่วคราวแล้ว")
+            await interaction.response.send_message(**await self.notice("music", "pause", "หยุดชั่วคราว", f"โดย {interaction.user.display_name}"))
         else:
             await interaction.response.send_message("ไม่มีเพลงที่กำลังเล่นอยู่", ephemeral=True)
 
@@ -1378,7 +1460,7 @@ class Music(commands.Cog):
         if not player:
             return
         if player.resume():
-            await interaction.response.send_message("▶️ เล่นต่อแล้ว")
+            await interaction.response.send_message(**await self.notice("music", "play", "เล่นต่อแล้ว", f"โดย {interaction.user.display_name}"))
         else:
             await interaction.response.send_message("เพลงไม่ได้หยุดอยู่", ephemeral=True)
 
@@ -1392,7 +1474,7 @@ class Music(commands.Cog):
     async def stop(self, interaction: discord.Interaction) -> None:
         if not await self.get_player(interaction) or not await self.require_dj(interaction):
             return
-        await interaction.response.send_message("⏹️ หยุดเล่นและออกจากห้องแล้ว บ๊ายบาย 👋")
+        await interaction.response.send_message(**await self.notice("info", "stop", "หยุดเล่นแล้ว", "ออกจากห้องเสียงแล้ว บ๊ายบาย"))
         await self.destroy(interaction.guild)
 
     @app_commands.command(name="leave", description="ให้บอทออกจากห้องเสียง (DJ)")
@@ -1402,7 +1484,7 @@ class Music(commands.Cog):
             return
         if not await self.require_dj(interaction):
             return
-        await interaction.response.send_message("👋 ออกจากห้องเสียงแล้ว")
+        await interaction.response.send_message(**await self.notice("info", "stop", "ออกจากห้องเสียงแล้ว"))
         await self.destroy(interaction.guild)
 
     @app_commands.command(name="seek", description="กระโดดไปยังตำแหน่งในเพลง เช่น 1:30")
@@ -1423,7 +1505,8 @@ class Music(commands.Cog):
             await interaction.response.send_message(f"เพลงนี้ยาวแค่ {fmt_duration(track.duration)}", ephemeral=True)
         else:
             player.restart(seconds)
-            await interaction.response.send_message(f"⏩ ไปที่ **{fmt_duration(seconds) if seconds else '0:00'}**")
+            await interaction.response.send_message(**await self.notice(
+                "music", "clock", f"ไปที่ {fmt_duration(seconds) if seconds else '0:00'}", track.display_name))
 
     @app_commands.command(name="filter", description="ใส่เอฟเฟกต์เสียง")
     @app_commands.describe(effect="เอฟเฟกต์ที่ต้องการ")
@@ -1436,8 +1519,9 @@ class Music(commands.Cog):
         player.filter = effect.value
         if player.current:
             player.restart(position)
-        await interaction.response.send_message(
-            "🎛️ ปิดเอฟเฟกต์เสียงแล้ว" if effect.value == "off" else f"🎛️ ใส่เอฟเฟกต์ **{effect.name}** แล้ว")
+        await interaction.response.send_message(**await self.notice(
+            "music", "sliders", "ปิดเอฟเฟกต์เสียงแล้ว" if effect.value == "off"
+            else f"เอฟเฟกต์: {FILTERS[effect.value].label.split(' ', 1)[-1]}"))
 
     @app_commands.command(name="autoplay", description="เปิด/ปิดการหาเพลงแนวเดียวกันมาเล่นต่อเมื่อคิวหมด")
     @app_commands.describe(enabled="เปิดหรือปิด (เว้นว่าง = สลับ)")
@@ -1464,8 +1548,8 @@ class Music(commands.Cog):
         """Look up lyrics and reply (after defer) with paged embeds."""
         result = await find_lyrics(title, artist, duration)
         if not result:
-            await interaction.followup.send(f"😢 ไม่พบเนื้อเพลง **{title[:100]}** — ลองพิมพ์ชื่อเพลงเองด้วย `/lyrics song:ศิลปิน ชื่อเพลง`",
-                                            ephemeral=ephemeral)
+            await interaction.followup.send(ephemeral=ephemeral, **await self.notice(
+                "warn", "lyrics", "ไม่พบเนื้อเพลง", title[:80], detail="ลองพิมพ์ชื่อเพลงเองด้วย `/lyrics song:ศิลปิน ชื่อเพลง`"))
             return
         chunks = _chunk_lines(result.text)
         pages = []
@@ -1509,7 +1593,7 @@ class Music(commands.Cog):
             return
         player.set_volume(level / 100)
         await self.storage.set_setting(interaction.guild_id, "volume", str(level))
-        await interaction.response.send_message(f"🔊 ตั้งระดับเสียงเป็น **{level}%** (จำไว้สำหรับเซิร์ฟเวอร์นี้)")
+        await interaction.response.send_message(**await self.notice("music", "speaker", f"ระดับเสียง {level}%", "จำไว้สำหรับเซิร์ฟเวอร์นี้"))
 
     @app_commands.command(name="loop", description="ตั้งโหมดวนซ้ำ")
     @app_commands.describe(mode="โหมดวนซ้ำ")
@@ -1519,7 +1603,7 @@ class Music(commands.Cog):
         if not player:
             return
         player.loop_mode = mode.value
-        await interaction.response.send_message(f"🔁 โหมดวนซ้ำ: **{mode.name}**")
+        await interaction.response.send_message(**await self.notice("music", "loop_one" if mode.value == "track" else "loop", f"วนซ้ำ: {mode.name}"))
 
     @app_commands.command(name="shuffle", description="สลับลำดับเพลงในคิว")
     async def shuffle(self, interaction: discord.Interaction) -> None:
@@ -1527,7 +1611,7 @@ class Music(commands.Cog):
         if not player:
             return
         random.shuffle(player.queue)
-        await interaction.response.send_message(f"🔀 สลับลำดับ {len(player.queue)} เพลงในคิวแล้ว")
+        await interaction.response.send_message(**await self.notice("music", "shuffle", "สลับลำดับเพลงแล้ว", f"{len(player.queue)} เพลงในคิว"))
 
     @app_commands.command(name="remove", description="ลบเพลงออกจากคิวตามลำดับ")
     @app_commands.describe(position="ลำดับเพลงในคิว (ดูได้จาก /queue)")
@@ -1543,7 +1627,7 @@ class Music(commands.Cog):
             await interaction.response.send_message("ลบได้เฉพาะเพลงที่คุณขอเอง (หรือต้องเป็น DJ)", ephemeral=True)
             return
         player.queue.pop(position - 1)
-        await interaction.response.send_message(f"🗑️ ลบ **{track.title}** ออกจากคิวแล้ว")
+        await interaction.response.send_message(**await self.notice("info", "trash", "ลบออกจากคิวแล้ว", track.display_name))
 
     @app_commands.command(name="clear", description="ล้างคิวเพลงทั้งหมด เพลงที่เล่นอยู่ยังเล่นต่อ (DJ)")
     async def clear(self, interaction: discord.Interaction) -> None:
@@ -1552,7 +1636,7 @@ class Music(commands.Cog):
             return
         count = len(player.queue)
         player.queue.clear()
-        await interaction.response.send_message(f"🧹 ล้างคิว {count} เพลงแล้ว")
+        await interaction.response.send_message(**await self.notice("info", "trash", "ล้างคิวแล้ว", f"{count} เพลง"))
 
     @app_commands.command(name="search", description="ค้นหาเพลงบน YouTube แล้วเลือกเองจาก 5 อันดับแรก")
     @app_commands.describe(query="ชื่อเพลง / ศิลปินที่ต้องการค้นหา")
@@ -1564,7 +1648,7 @@ class Music(commands.Cog):
             log.warning("Search failed for %r: %r", query, e)
             entries = []
         if not entries:
-            await interaction.followup.send(f"😢 ไม่พบผลการค้นหา **{query[:100]}**")
+            await interaction.followup.send(**await self.notice("warn", "x", "ไม่พบผลการค้นหา", query[:80]))
             return
         tracks = [Track.from_info(e, interaction.user, resolved=False) for e in entries]
         lines = "\n".join(
@@ -1589,7 +1673,8 @@ class Music(commands.Cog):
         del player.queue[:position - 1]
         title = player.queue[0].title
         player.jump()
-        await interaction.response.send_message(f"⏩ ข้ามไปเล่น **{title}**" + (f" (ข้ามไป {position - 1} เพลง)" if position > 1 else ""))
+        await interaction.response.send_message(**await self.notice(
+            "music", "next", "ข้ามไปเล่น", title + (f" (ข้ามไป {position - 1} เพลง)" if position > 1 else "")))
 
     @app_commands.command(name="move", description="ย้ายเพลงในคิวไปลำดับใหม่")
     @app_commands.describe(position="ลำดับเพลงที่จะย้าย", to="ย้ายไปไว้ลำดับที่")
@@ -1607,7 +1692,7 @@ class Music(commands.Cog):
         player.queue.pop(position - 1)
         to = min(to, len(player.queue) + 1)
         player.queue.insert(to - 1, track)
-        await interaction.response.send_message(f"↕️ ย้าย **{track.title}** ไปลำดับที่ {to} แล้ว")
+        await interaction.response.send_message(**await self.notice("music", "queue", "ย้ายเพลงแล้ว", f"{track.display_name} → ลำดับที่ {to}"))
 
     @app_commands.command(name="previous", description="กลับไปเล่นเพลงก่อนหน้า")
     async def previous(self, interaction: discord.Interaction) -> None:
@@ -1622,7 +1707,7 @@ class Music(commands.Cog):
         if not prev:
             await interaction.response.send_message("ยังไม่มีเพลงก่อนหน้า", ephemeral=True)
             return
-        await interaction.response.send_message(f"⏮️ กลับไปเล่น **{prev.title}**")
+        await interaction.response.send_message(**await self.notice("music", "previous", "กลับไปเพลงก่อนหน้า", prev.display_name))
 
     @app_commands.command(name="replay", description="เล่นเพลงนี้ใหม่ตั้งแต่ต้น")
     async def replay(self, interaction: discord.Interaction) -> None:
@@ -1633,7 +1718,7 @@ class Music(commands.Cog):
             await interaction.response.send_message("ไม่มีเพลงที่กำลังเล่นอยู่", ephemeral=True)
             return
         player.restart(0)
-        await interaction.response.send_message(f"🔂 เล่น **{player.current.title}** ใหม่ตั้งแต่ต้น")
+        await interaction.response.send_message(**await self.notice("music", "loop_one", "เล่นใหม่ตั้งแต่ต้น", player.current.display_name))
 
     @app_commands.command(name="history", description="ดูเพลงที่เล่นไปล่าสุด แล้วเลือกเปิดซ้ำได้")
     async def history(self, interaction: discord.Interaction) -> None:
@@ -1681,8 +1766,10 @@ class Music(commands.Cog):
             return
         await interaction.response.defer(thinking=True)
         error = await self.speak_text(interaction.user, interaction.channel, text, voice.value if voice else "female")
-        await interaction.followup.send(error or f"🔊 **{interaction.user.display_name}** ให้บอทพูดว่า: {text[:300]}",
-                                        allowed_mentions=NO_PINGS)
+        if error:
+            await interaction.followup.send(**await self.notice("warn", "alert", "พูดไม่ได้", re.sub(r"^\W+", "", error)))
+        else:
+            await interaction.followup.send(**await self.notice("music", "speaker", f"{interaction.user.display_name} ให้บอทพูด", text[:120]))
 
     @app_commands.command(name="talk", description="เปิด/ปิดโหมดให้บอทอ่านคำตอบ AI ออกเสียงในห้องเสียง")
     @app_commands.describe(enabled="เปิดหรือปิด", voice="เสียงผู้หญิงหรือผู้ชาย")
@@ -1692,10 +1779,53 @@ class Music(commands.Cog):
         if not await self.require_dj(interaction):
             return
         await self.storage.set_setting(interaction.guild_id, "talk", (voice.value if voice else "female") if enabled else None)
-        await interaction.response.send_message(
-            "🗣️ เปิดโหมดพูดแล้ว — เวลาคนที่อยู่ในห้องเสียง @บอท บอทจะอ่านคำตอบออกเสียงด้วย" if enabled
-            else "🤐 ปิดโหมดพูดแล้ว")
+        await interaction.response.send_message(**await self.notice(
+            "info", "speaker" if enabled else "x", "เปิดโหมดพูดแล้ว" if enabled else "ปิดโหมดพูดแล้ว",
+            "คนในห้องเสียง @บอท แล้วบอทจะอ่านคำตอบออกเสียง" if enabled else None))
 
+
+    @app_commands.command(name="normalize", description="ปรับเสียงทุกเพลงให้ดังเท่ากัน (เปิดอยู่เป็นค่าเริ่มต้น)")
+    @app_commands.describe(enabled="เปิดหรือปิด")
+    async def normalize(self, interaction: discord.Interaction, enabled: bool) -> None:
+        await self.storage.set_setting(interaction.guild_id, "normalize", "1" if enabled else "0")
+        player = self.players.get(interaction.guild_id)
+        if player and player.normalize != enabled:
+            player.normalize = enabled
+            if player.current:
+                player.restart(player.position)  # apply to the song that's playing now
+        await interaction.response.send_message(**await self.notice(
+            "music", "speaker", "ปรับเสียงให้ดังเท่ากัน: เปิด" if enabled else "ปรับเสียงให้ดังเท่ากัน: ปิด",
+            "ทุกเพลงจะดังพอๆ กัน ไม่ต้องคอยปรับเสียง" if enabled else "เล่นตามความดังเดิมของแต่ละเพลง"))
+
+    @app_commands.command(name="sleep", description="ตั้งเวลาปิดเพลง เช่น 30m, 1h, 'จบเพลง' หรือ 'off'")
+    @app_commands.describe(time="เช่น 30m, 45 (นาที), 1h30m, 'จบเพลง' = หลังเพลงนี้ หรือ 'off' = ยกเลิก")
+    async def sleep(self, interaction: discord.Interaction, time: str) -> None:
+        player = await self.get_player(interaction)
+        if not player:
+            return
+        text = time.strip().lower()
+        if text in ("off", "cancel", "ยกเลิก", "ปิด", "0"):
+            player.set_sleep(None)
+            await interaction.response.send_message(**await self.notice("info", "clock", "ยกเลิกตั้งเวลาปิดเพลงแล้ว"))
+            return
+        if text in ("end", "จบเพลง", "หลังเพลงนี้", "track"):
+            player.set_sleep(None, after_track=True)
+            await interaction.response.send_message(**await self.notice(
+                "sleep", "moon", "ปิดเพลงหลังเพลงนี้จบ", player.current.display_name if player.current else None))
+            return
+        seconds = float(text) * 60 if text.replace(".", "", 1).isdigit() else None  # plain number = minutes
+        if seconds is None:
+            when = parse_when(text)
+            seconds = (when - datetime.now(THAI_TZ)).total_seconds() if when else None
+        if not seconds or seconds < 30 or seconds > 12 * 3600:
+            await interaction.response.send_message("ใส่เวลาแบบ `30m`, `45`, `1h30m`, `จบเพลง` หรือ `off` (ไม่เกิน 12 ชั่วโมง)", ephemeral=True)
+            return
+        player.set_sleep(seconds)
+        end = datetime.now(THAI_TZ) + timedelta(seconds=seconds)
+        minutes = round(seconds / 60)
+        await interaction.response.send_message(**await self.notice(
+            "sleep", "clock", f"ตั้งเวลาปิดเพลงอีก {minutes} นาที" if minutes < 120 else f"ตั้งเวลาปิดเพลงอีก {minutes / 60:.1f} ชั่วโมง",
+            f"เพลงจะค่อยๆ เบาลงแล้วหยุดตอน {end:%H:%M} น."))
 
     # ---------- /playlist ----------
 
@@ -1718,7 +1848,7 @@ class Music(commands.Cog):
             await interaction.response.send_message(f"มีเพลย์ลิสต์ครบ {MAX_PLAYLISTS_PER_USER} อันแล้ว ลบอันเก่าด้วย `/playlist delete` ก่อนนะ", ephemeral=True)
             return
         await self.storage.save_playlist(interaction.user.id, name, [t.to_dict() for t in tracks[:MAX_SAVED_TRACKS]])
-        await interaction.response.send_message(f"💾 บันทึกเพลย์ลิสต์ **{name}** ({min(len(tracks), MAX_SAVED_TRACKS)} เพลง) แล้ว")
+        await interaction.response.send_message(**await self.notice("ok", "star", "บันทึกเพลย์ลิสต์แล้ว", f"{name} • {min(len(tracks), MAX_SAVED_TRACKS)} เพลง"))
 
     @playlist.command(name="load", description="เปิดเพลย์ลิสต์ที่บันทึกไว้ (เพิ่มเข้าคิว)")
     @app_commands.describe(name="ชื่อเพลย์ลิสต์", shuffle="สุ่มลำดับเพลงด้วยไหม")
@@ -1791,7 +1921,7 @@ class Music(commands.Cog):
             if vc and not any(not m.bot for m in vc.channel.members):
                 player = self.players.get(guild.id)
                 if player:
-                    await player._send("👋 ไม่มีใครอยู่ในห้องเสียงแล้ว ขอออกก่อนนะ")
+                    await player._notice("sleep", "moon", "ไม่มีใครอยู่ในห้องเสียงแล้ว", "ขอออกก่อนนะ")
                 await self.destroy(guild)
         finally:
             self._alone_tasks.pop(guild.id, None)

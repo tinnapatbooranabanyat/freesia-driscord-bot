@@ -34,7 +34,8 @@ HELP_SECTIONS = [
         "• `@บอท เปิดเพลงเศร้าๆ ให้หน่อย` หรือ `/dj` — AI เลือกเพลงให้\n"
         "• `/pause` `/resume` `/skip` (โหวต) `/previous` `/replay` `/skipto` `/seek 1:30` `/stop` `/leave`\n"
         "• `/queue` `/move` `/remove` `/clear` `/shuffle` `/loop` • `/nowplaying` `/lyrics` `/history`\n"
-        "• `/filter` เอฟเฟกต์เสียง • `/autoplay` • `/volume` • `/playlist save|load|list|delete`"
+        "• `/filter` เอฟเฟกต์เสียง • `/autoplay` • `/volume` • `/normalize` เสียงดังเท่ากัน • `/sleep 30m` ตั้งเวลาปิด\n"
+        "• `/playlist save|load|list|delete` (★ บนการ์ด = เพิ่มลง Favorites)"
     )),
     ("🗣️ เสียง & เกม", (
         "• `/say` ให้บอทพูด • `/talk` ให้บอทอ่านคำตอบ AI ออกเสียง\n"

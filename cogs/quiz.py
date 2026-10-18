@@ -272,7 +272,7 @@ class Game:
             source = discord.FFmpegPCMAudio(
                 stream, executable=FFMPEG_PATH,
                 before_options=f"-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin -ss {start:.1f}",
-                options=f"-vn -t {SNIPPET + 4}",
+                options=f"-vn -af loudnorm=I=-14:TP=-1.5:LRA=11 -t {SNIPPET + 4}",  # same loudness for every song
             )
             if vc.is_playing():
                 vc.stop()

@@ -425,3 +425,59 @@ def circle_png(data: bytes, size: int = 128) -> bytes:
     out = io.BytesIO()
     _circle(img, size).save(out, "PNG")
     return out.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Notice banner (short status messages: errors, "left the channel", volume changed...)
+# ---------------------------------------------------------------------------
+
+NW, NH = 1000, 190
+NOTICE_COLOURS = {
+    "error": (226, 68, 80), "warn": (236, 150, 44), "ok": (46, 184, 112),
+    "music": (150, 92, 238), "info": (88, 116, 242), "sleep": (92, 104, 190),
+}
+
+
+def render_notice(icon: str, title: str, subtitle: str | None, kind: str = "info") -> tuple[bytes, tuple[int, int, int]]:
+    """Return (JPEG bytes, colour) for a compact banner: round icon badge + bold title + subtitle."""
+    with _LOCK:
+        return _render_notice(icon, title, subtitle, kind)
+
+
+def _render_notice(icon_name, title, subtitle, kind):
+    from core.icons import glyph  # local import: icons is only needed for banners
+
+    colour = NOTICE_COLOURS.get(kind, NOTICE_COLOURS["info"])
+    dark = tuple(int(c * 0.32) for c in colour)
+    # left-to-right gradient: tinted colour -> near black
+    ramp = Image.linear_gradient("L").rotate(90, expand=True).resize((NW, NH))  # 255 left -> 0 right
+    card = Image.composite(Image.new("RGB", (NW, NH), dark), Image.new("RGB", (NW, NH), (17, 17, 22)), ramp).convert("RGBA")
+
+    # big faint icon bleeding off the right edge
+    big = glyph(icon_name, 300)
+    faint = Image.new("RGBA", big.size, colour + (0,))
+    faint.putalpha(big.getchannel("A").point(lambda v: v * 22 // 255))
+    card.alpha_composite(faint, (NW - 250, (NH - 300) // 2))
+
+    # glowing round badge with the icon
+    cx, cy, r = 100, NH // 2, 58
+    glow = Image.new("RGBA", (NW, NH), (0, 0, 0, 0))
+    ImageDraw.Draw(glow).ellipse((cx - r - 14, cy - r - 14, cx + r + 14, cy + r + 14), fill=colour + (120,))
+    card.alpha_composite(glow.filter(ImageFilter.GaussianBlur(16)))
+    badge = Image.new("RGBA", (r * 8, r * 8), (0, 0, 0, 0))
+    ImageDraw.Draw(badge).ellipse((0, 0, r * 8 - 1, r * 8 - 1), fill=colour + (255,))
+    badge = badge.resize((r * 2, r * 2), Image.LANCZOS)
+    card.alpha_composite(badge, (cx - r, cy - r))
+    icon = glyph(icon_name, 62)
+    card.alpha_composite(icon, (cx - 31, cy - 31))
+
+    x, max_w = 196, NW - 196 - 60
+    if subtitle:
+        _draw_text(card, (x, 88), _fit(title, "bold", 40, max_w), "bold", 40, (255, 255, 255))
+        _draw_text(card, (x, 134), _fit(subtitle, "regular", 26, max_w), "regular", 26, (215, 215, 228))
+    else:
+        _draw_text(card, (x, 110), _fit(title, "bold", 42, max_w), "bold", 42, (255, 255, 255))
+
+    out = io.BytesIO()
+    card.convert("RGB").save(out, "JPEG", quality=90, optimize=True)
+    return out.getvalue(), colour

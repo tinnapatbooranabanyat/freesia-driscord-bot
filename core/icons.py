@@ -100,9 +100,50 @@ def _draw(name: str) -> Image.Image:
         d.arc(_box(24, 26, 76, 70), 0, 180, fill=WHITE, width=int(8 * S / 100))
         d.rounded_rectangle(_box(46, 68, 54, 84), radius=S * 0.02, fill=WHITE)
         d.rounded_rectangle(_box(32, 82, 68, 90), radius=S * 0.03, fill=WHITE)
+    # ---- glyphs used only on notice banners ----
+    elif name == "x":
+        w = int(13 * S / 100)
+        d.line(_p(24, 24, 76, 76), fill=WHITE, width=w)
+        d.line(_p(76, 24, 24, 76), fill=WHITE, width=w)
+    elif name == "check":
+        d.line(_p(18, 52, 40, 74, 84, 28), fill=WHITE, width=int(13 * S / 100), joint="curve")
+    elif name == "alert":
+        d.rounded_rectangle(_box(43, 14, 57, 62), radius=S * 0.05, fill=WHITE)
+        d.ellipse(_box(42, 70, 58, 86), fill=WHITE)
+    elif name == "info":
+        d.ellipse(_box(42, 12, 58, 28), fill=WHITE)
+        d.rounded_rectangle(_box(43, 38, 57, 86), radius=S * 0.05, fill=WHITE)
+    elif name == "moon":
+        d.ellipse(_box(14, 14, 82, 82), fill=WHITE)
+        d.ellipse(_box(36, 4, 100, 68), fill=(0, 0, 0, 0))  # bite out a crescent
+    elif name == "speaker":
+        d.polygon(_p(14, 38, 30, 38, 52, 18, 52, 82, 30, 62, 14, 62), fill=WHITE)
+        d.arc(_box(42, 32, 70, 68), -50, 50, fill=WHITE, width=int(8 * S / 100))
+        d.arc(_box(42, 16, 90, 84), -50, 50, fill=WHITE, width=int(8 * S / 100))
+    elif name == "sliders":
+        w = int(7 * S / 100)
+        for x, knob in ((26, 34), (50, 64), (74, 44)):
+            d.line(_p(x, 14, x, 86), fill=WHITE, width=w)
+            d.ellipse(_box(x - 11, knob - 11, x + 11, knob + 11), fill=WHITE)
+    elif name == "clock":
+        d.ellipse(_box(12, 12, 88, 88), outline=WHITE, width=int(9 * S / 100))
+        d.line(_p(50, 26, 50, 52, 66, 62), fill=WHITE, width=int(9 * S / 100), joint="curve")
+    elif name == "trash":
+        d.rounded_rectangle(_box(18, 20, 82, 30), radius=S * 0.03, fill=WHITE)
+        d.rounded_rectangle(_box(38, 10, 62, 22), radius=S * 0.03, fill=WHITE)
+        d.polygon(_p(24, 34, 76, 34, 70, 88, 30, 88), fill=WHITE)
+    elif name == "note":
+        d.ellipse(_box(18, 62, 46, 86), fill=WHITE)
+        d.rounded_rectangle(_box(38, 12, 46, 76), radius=S * 0.02, fill=WHITE)
+        d.polygon(_p(46, 12, 80, 24, 80, 40, 46, 28), fill=WHITE)
     else:
         raise ValueError(name)
     return img
+
+
+def glyph(name: str, size: int) -> Image.Image:
+    """White icon on transparent background at `size` px (for drawing onto banners)."""
+    return _draw(name).resize((size, size), Image.LANCZOS)
 
 
 ICON_NAMES = ("play", "pause", "next", "previous", "stop", "loop", "loop_one", "shuffle", "autoplay",
