@@ -196,9 +196,9 @@ class Game:
         self.stopped = True
         self.skip_round.set()
 
-    async def _stream(self, song: Song) -> str | None:
+    async def _stream(self, song: Song, fallback: bool = False) -> str | None:
         try:
-            info = await asyncio.get_running_loop().run_in_executor(None, media.extract_single, song.url)
+            info = await asyncio.get_running_loop().run_in_executor(None, media.extract_single, song.url, fallback)
             song.duration = song.duration or info.get("duration")
             song.thumbnail = info.get("thumbnail") or song.thumbnail
             return info["url"]
@@ -265,7 +265,7 @@ class Game:
         loop = asyncio.get_running_loop()
         for attempt in range(3):
             if not stream:
-                stream = await self._stream(song)
+                stream = await self._stream(song, fallback=attempt > 0)  # retries ask through another client
                 if not stream:
                     return False
             ended = asyncio.Event()

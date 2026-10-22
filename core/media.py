@@ -18,9 +18,13 @@ log = logging.getLogger(__name__)
 MAX_PLAYLIST = 200
 MAX_MIX = 50  # YouTube Mixes (list=RD...) are endless; take the first songs only
 STREAM_URL_TTL = 3 * 60 * 60  # YouTube stream URLs expire after ~6h; re-resolve well before that
+# YouTube "player clients" yt-dlp asks for stream URLs. Which ones give URLs that ffmpeg can actually play
+# (no 403) changes with YouTube and yt-dlp releases: visionos works without PO tokens as of 2026-10.
+PLAYER_CLIENTS = [c.strip() for c in (os.getenv("YTDL_PLAYER_CLIENTS") or "visionos,default").split(",") if c.strip()]
+FALLBACK_CLIENTS = ["default"]  # yt-dlp's own choice, used when a stream from the preferred clients fails
 
 
-def _ytdl_opts(cookies: bool = False, **extra) -> dict:
+def _ytdl_opts(cookies: bool = False, clients: list[str] | None = None, **extra) -> dict:
     opts = {
         "format": "bestaudio/best",
         "quiet": True,
@@ -28,6 +32,7 @@ def _ytdl_opts(cookies: bool = False, **extra) -> dict:
         "noplaylist": True,
         "skip_download": True,
         "source_address": "0.0.0.0",
+        "extractor_args": {"youtube": {"player_client": clients or PLAYER_CLIENTS}},
     }
     cookie_file = os.getenv("YTDL_COOKIES")
     if cookies and cookie_file and os.path.isfile(cookie_file):
@@ -51,9 +56,10 @@ def _extract(query: str, **extra) -> dict:
             return ydl.extract_info(query, download=False)
 
 
-def extract_single(query: str) -> dict:
-    """Fully resolve one video (URL or 'ytsearch1:...'), including the direct audio stream URL."""
-    info = _extract(query)
+def extract_single(query: str, fallback: bool = False) -> dict:
+    """Fully resolve one video (URL or 'ytsearch1:...'), including the direct audio stream URL.
+    fallback=True asks with FALLBACK_CLIENTS (after a stream from the preferred clients failed to play)."""
+    info = _extract(query, clients=FALLBACK_CLIENTS) if fallback else _extract(query)
     if info and "entries" in info:
         info = next((e for e in info["entries"] if e), None)
     if not info or not info.get("url"):
@@ -212,11 +218,11 @@ class Track:
         song, artist = clean_title(self.title, self.artist)
         return f"{artist} - {song}" if artist and song and artist.lower() not in song.lower() else (song or self.title)
 
-    async def resolve(self) -> None:
+    async def resolve(self, fallback: bool = False) -> None:
         if self.stream_url and time.time() - self.resolved_at < STREAM_URL_TTL:
             return
         query = self.url or f"ytsearch1:{self.search}"
-        info = await asyncio.get_running_loop().run_in_executor(None, extract_single, query)
+        info = await asyncio.get_running_loop().run_in_executor(None, extract_single, query, fallback)
         self.stream_url = info["url"]
         self.resolved_at = time.time()
         self.url = info.get("webpage_url") or self.url

@@ -99,6 +99,7 @@ class GuildPlayer:
         self.synced_for: Track | None = None
         self.np_lyric_index: int | None = None
         self.np_last_edit = 0.0  # monotonic time of the last card send/edit
+        self._use_fallback = False  # next resolve uses yt-dlp's fallback clients (a stream just failed)
         self.normalize = True  # loudness normalisation (per-server setting)
         self.sleep_until: float | None = None  # wall-clock time the sleep timer stops the music
         self.sleep_after_track = False  # stop when the current song ends
@@ -341,6 +342,9 @@ class GuildPlayer:
                 self.queue.append(prev)
         if not self.queue and self.autoplay and self.last_track:
             await self._autoplay_fill()
+        if not self.queue and self.np_message:
+            old, self.np_message = self.np_message, None
+            await self.cog.delete_message(old)  # nothing is playing any more
         while not self.queue:
             if self._interrupts:
                 return _INTERRUPT, 0.0, False
@@ -438,7 +442,8 @@ class GuildPlayer:
                         return
                     vc = self.guild.voice_client
                 try:
-                    await track.resolve()
+                    fallback, self._use_fallback = self._use_fallback, False
+                    await track.resolve(fallback=fallback)
                     failures = 0
                 except Exception as e:
                     log.warning("Failed to resolve %s: %r", track.title, e)
@@ -483,13 +488,19 @@ class GuildPlayer:
                 # The stream died right away (YouTube sometimes answers 403 for a stream URL, or it expired):
                 # fetch a fresh URL and try the song once more instead of silently skipping it
                 played = time.monotonic() - self._play_started
-                if (played < 3 and not self._skip and not self._jump and self._restart_at is None
-                        and not self._voice_lost() and (track.duration or 0) > 15 and not track.retried):
+                died = (played < 3 and not self._skip and not self._jump and self._restart_at is None
+                        and not self._voice_lost() and (track.duration or 0) > 15)
+                if died and not track.retried:
                     log.info("Stream for %s ended after %.1fs, retrying with a fresh URL", track.title, played)
                     track.retried = True
                     track.stream_url = None
+                    self._use_fallback = True  # ask YouTube through another client this time
                     self._restart_at = offset
                     continue
+                if died:
+                    log.warning("Stream for %s failed again; skipping it", track.title)
+                    await self._notice("warn", "alert", "เปิดเพลงนี้ไม่ได้", f"ข้าม {track.display_name}",
+                                       detail="YouTube ไม่ให้โหลดเสียง (403) ลองใหม่อีกครั้งภายหลัง")
 
                 if self.sleep_after_track and self._restart_at is None and not self._voice_lost():
                     await self._notice("sleep", "moon", "จบเพลงนี้แล้ว ถึงเวลาพัก", "หลับฝันดีนะ ขอออกจากห้องเสียงก่อน")
